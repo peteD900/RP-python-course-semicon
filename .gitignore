@@ -1,0 +1,22 @@
+# Generated databases (run data/generate.py to recreate)
+*.db
+
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Quarto rendered output
+_freeze/
+*.html
+*.pdf
+
+# Distribution
+dist/
+*.egg-info/
