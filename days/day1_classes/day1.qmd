@@ -14,33 +14,62 @@ execute:
 jupyter: python3
 ---
 
-## Overview
+## Who this is for
 
-After today you will understand:
+You already write competent procedural Python: you live in pandas, you have a
+`get_data.py` module full of helper functions you reuse across notebooks, and
+you can wrangle a messy extract into a tidy frame without thinking about it.
+What you *haven't* deliberately practised is **object-oriented design** — and,
+just as importantly, **knowing when it's worth it.**
 
-- Why a **class earns its keep** over a plain dict or function
-- How `__init__` and `self` work
-- The difference between class and instance attributes (and a nasty trap)
-- How `__repr__` transforms your debugging experience
+This course teaches classes, but the real skill is judgment. So Day 1 does two
+things at once:
 
-We start with the **procedural approach**, feel the pain, then build the
-`WaferDataset` class. The polished version lives in `fab_toolkit` and
-accumulates features across all five days.
+1. Builds your first genuinely useful class, `WaferDataset`, one concept at a
+   time, with the *why* spelled out for each piece.
+2. Is honest about **when a class is the wrong tool** — because most of your
+   EDA helpers should stay plain functions, and you should be able to say
+   exactly why.
+
+By the end you'll understand `__init__`, `self`, the class-vs-instance attribute
+distinction (and the bug it causes), methods, `__repr__` — and you'll have a
+defensible mental model for *class vs function vs dataclass vs just-a-dataframe*.
 
 ---
 
-## 1 · Setup & Data
+## The fab context
 
-Run `python data/generate.py` from the repo root before rendering this
-notebook. The path below is relative to this `.qmd` file's location.
+We're analysing **PCM (Process Control Monitoring) data**: small electrical test
+structures placed at fixed sites on each wafer and measured after key process
+steps. The headline parameter today is **Vth** (threshold voltage) — roughly,
+the gate voltage at which a transistor turns on. A Vth that drifts out of spec
+means the devices behave differently than designed, which shows up as yield loss
+or binning shifts downstream.
+
+The data is **synthetic but structurally realistic** (`data/generate.py`,
+seeded). It is deliberately *not* real fab data — the physics is simplified so we
+can focus on software design, not device modelling. There's a planted signal:
+one lot has a Vth excursion, and the capstone (Day 5) traces it back to a
+process-timing drift. Today we just learn to *hold* this data well.
+
+The shape of almost every fab-analysis task you'll do is the same loop:
+
+> **extract** (pull from a DB) → **munge** (filter, join, reshape) →
+> **model** (KPIs, a fit) → **plot** (wafer maps, trends) → **report**.
+
+Day 1 is about the very first handoff in that loop: once you've extracted a
+frame, *what do you carry it around in?* A bare DataFrame? A dict? Or something
+that also remembers where it came from and what you can do to it?
+
+> **Run `python data/generate.py` from the repo root before rendering this
+> notebook.** The path below is relative to this `.qmd` file's directory, which
+> is the working directory Quarto uses during render.
 
 ```{python}
 import sqlite3
 from pathlib import Path
 import pandas as pd
 
-# Relative to this file's directory (days/day1_classes/).
-# Quarto sets cwd to the .qmd file's directory during render.
 DB_PATH = Path("../../data/electrical.db")
 
 conn = sqlite3.connect(DB_PATH)
@@ -49,169 +78,237 @@ conn.close()
 
 print(f"Total rows: {len(df_all):,}")
 print(f"Lots:       {sorted(df_all['lot_id'].unique())}")
-print(f"Wafers:     {df_all['wafer_id'].nunique()} per lot")
-print(f"Columns:    {list(df_all.columns)}")
+print(f"Wafers/lot: {df_all['wafer_id'].nunique()}")
+print(f"Sites/wafer:{df_all['site_id'].nunique()}")
+print(f"Devices:    {sorted(df_all['device_type'].unique())}")
+df_all.head()
 ```
 
-```{python}
-# Grab one lot to work with throughout this lesson.
-df_l001 = df_all[df_all["lot_id"] == "L001"].copy()
-df_l001.head()
-```
+So: 5 lots × 25 wafers × 9 PCM sites. Each row is one electrical measurement at
+one site on one wafer. That's the grain we'll work at all course.
 
 ---
 
-## 2 · The Pain of Dicts
+## Three recurring tasks (our running examples)
 
-Before classes, the natural move is to bundle a DataFrame with its metadata in
-a plain dict.
+Rather than invent abstractions and look for uses, let's start from three jobs
+you'll genuinely do over and over, and let the design fall out of them.
+
+- **Task A — "Pull everything for these lots."** A reliability engineer asks for
+  all data on lots L001 and L003 to compare against a reference. You subset by a
+  *list* of lots.
+- **Task B — "Just the TFTs, for a yield review."** The review only cares about
+  the transistor sites (`device_type == "TFT"`), not the resistors or capacitors.
+  You subset by device type.
+- **Task C — "Where did this come from?"** Three weeks later someone hands you a
+  CSV called `final_v2.csv` and asks what query produced it and when. You have no
+  idea. You need data that *carries its own provenance*.
+
+Tasks A and B are pure data wrangling — and you'll see they're perfectly fine as
+plain functions. Task C is the one that quietly justifies a class. Hold that
+thought; we'll come back to it.
+
+---
+
+## The procedural baseline (this is not wrong!)
+
+Here's how you'd actually start: a couple of helper functions, exactly the kind
+you'd drop in `get_data.py`. **This is good, idiomatic, reusable code.** Do not
+let anyone tell you EDA must be objects-first.
 
 ```{python}
-# --- Procedural approach ---
+def load_electrical(db_path) -> pd.DataFrame:
+    """Extract the full electrical table."""
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql("SELECT * FROM electrical", conn)
+    finally:
+        conn.close()
 
-wafer_record = {
-    "lot_id":     "L001",
-    "data":       df_l001,
+
+def filter_lots(df: pd.DataFrame, lot_ids: list[str]) -> pd.DataFrame:
+    """Task A — subset to a list of lots."""
+    return df[df["lot_id"].isin(lot_ids)].copy()
+
+
+def filter_devices(df: pd.DataFrame, device_type: str) -> pd.DataFrame:
+    """Task B — subset to one device type."""
+    return df[df["device_type"] == device_type].copy()
+```
+
+```{python}
+df = load_electrical(DB_PATH)
+
+# Task A: lots L001 + L003
+ab = filter_lots(df, ["L001", "L003"])
+print("Task A rows:", len(ab))
+
+# Task B: TFTs only, within those lots
+abc = filter_devices(ab, "TFT")
+print("Task B rows:", len(abc))
+```
+
+Clean. Composable. Each function does one thing, takes a frame, returns a frame.
+If this were the whole job, **we'd stop here and there would be no lesson.** The
+functions are stateless transforms — the best possible fit for a function.
+
+So where does it strain?
+
+---
+
+## Where the dict/function approach strains
+
+The strain isn't in the *transforms*. It's in everything you want to keep
+*alongside* the data — Task C. Watch three specific failures.
+
+### Pain 1 — Provenance evaporates
+
+The frame `abc` knows nothing about itself. Which DB? Which query? Fetched when?
+The natural fix is to staple metadata on with a dict:
+
+```{python}
+record = {
+    "data":       abc,
     "source":     "electrical.db",
+    "query":      "lots L001,L003; TFT only",
     "fetched_at": "2024-01-15",
 }
 ```
 
-This works until it doesn't. Three things go wrong immediately:
+But nothing keeps that dict in sync with the data. The moment you transform
+again, you either rebuild the dict by hand (tedious, error-prone) or it goes
+stale and *lies* about what it contains. Provenance that drifts is worse than
+no provenance.
 
-**Pain 1 — No structure enforcement.**
-Python won't tell you about typos or missing fields.
+### Pain 2 — Nothing enforces structure
+
+Dicts accept anything. Typos and missing keys fail *later*, far from the cause:
 
 ```{python}
-# Both typos are silently accepted:
-bad_record = {
-    "lot":        "L001",   # should be lot_id
-    "fetced_at":  "2024-01-15",  # typo, not caught
+bad = {
+    "data":       abc,
+    "sorce":      "electrical.db",   # typo — silently accepted
+    "fetced_at":  "2024-01-15",      # typo — silently accepted
 }
-print(bad_record.keys())   # no error, no warning
+print("Keys:", list(bad.keys()))
+# Later, miles away: bad["source"] -> KeyError. Good luck tracing it.
 ```
 
-**Pain 2 — Methods scatter everywhere.**
-Logic that belongs with the data ends up as free functions.
+### Pain 3 — The transforms and the metadata don't travel together
 
-```{python}
-def summarize(record):
-    return record["data"].describe()
+`filter_devices` operates on the *frame*, not the *record*. So after filtering
+you have a new frame and a now-wrong dict. You can write `filter_record(record,
+...)` wrappers, but you're hand-rolling the coupling between data and metadata
+that a class gives you for free — and you'll forget to update one field
+eventually.
 
-def filter_device(record, device_type):
-    mask = record["data"]["device_type"] == device_type
-    return {**record, "data": record["data"].loc[mask].copy()}
-
-# Now you have to remember which functions go together.
-# Any new colleague will have no idea.
-tft_record = filter_device(wafer_record, "TFT")
-print(f"TFT rows: {len(tft_record['data'])}")
-```
-
-**Pain 3 — The repr is useless.**
-
-```{python}
-print(wafer_record)   # prints the entire DataFrame inside a dict — unhelpful
-```
-
-A class solves all three.
+The throughline: **the data and the facts about the data want to move as one
+unit, and stay consistent under transformation.** That coupling-with-invariants
+is precisely what a class is *for*. Tasks A and B didn't need it; Task C does.
 
 ---
 
-## 3 · First Class
+## Building the class, one concept at a time
 
-Let's build `WaferDataset` step by step. First, the absolute minimum:
+### `class`, `__init__`, and what `self` actually is
 
 ```{python}
 from datetime import datetime
 
-class WaferDataset:                           # class definition
-    def __init__(self, data, source, lot_id=None):   # constructor
-        self.data      = data                # instance attributes
-        self.source    = source
-        self.lot_id    = lot_id
+class WaferDataset:                                    # the blueprint
+    def __init__(self, data, source, lot_id=None):     # the initialiser
+        self.data       = data                         # store on THIS instance
+        self.source     = source
+        self.lot_id     = lot_id
         self.fetched_at = datetime.now()
 ```
 
-A few things to notice:
+Three things worth slowing down on:
 
-- `class WaferDataset:` — the *class* is a blueprint; calling it creates an *instance*.
-- `def __init__(self, ...)` — Python calls this automatically when you write
-  `WaferDataset(...)`. It is not a "magic" function; it's just `__init__`.
-- `self` — the instance itself, passed implicitly. `self.data = data` stores
-  `data` on *this particular instance*, not on the class.
+- **`class WaferDataset:` is a factory, not an object.** Calling it,
+  `WaferDataset(...)`, manufactures a new *instance*. The class is the cookie
+  cutter; instances are the cookies.
+- **`__init__` is not a constructor in the C++/Java sense.** By the time it runs,
+  the object already exists; `__init__`'s job is purely to *initialise* its
+  attributes. It's an ordinary method with a reserved name.
+- **`self` is just the instance, passed explicitly.** There's nothing magic about
+  the word — it's the first parameter, and Python binds it to the instance for
+  you. `self.data = data` writes `data` into *this specific object's* namespace.
+
+That last point is worth proving, because it demystifies the whole model:
 
 ```{python}
-ds = WaferDataset(df_l001, source="sqlite:electrical.db", lot_id="L001")
+ds = WaferDataset(df_all, source="sqlite:electrical.db", lot_id=None)
 
-print(type(ds))          # <class '__main__.WaferDataset'>
-print(ds.lot_id)         # L001
-print(ds.source)         # sqlite:electrical.db
-print(isinstance(ds, WaferDataset))  # True
+# A method call is sugar for calling the function with the instance as arg 1:
+print(ds.lot_id)                       # attribute access
+print(type(ds))                        # <class '__main__.WaferDataset'>
+
+# Where do the attributes actually live? In a per-instance dict:
+print(ds.__dict__)
 ```
 
-Already better: `ds.lot_id` is self-documenting. No dict key to remember.
+`ds.__dict__` is the instance's own namespace — a plain dict mapping attribute
+names to values. This is not a metaphor; it's literally how attribute storage
+works, and in a moment it will explain a notorious bug exactly.
 
----
+### Class vs instance attributes — and the mutable-default trap
 
-## 4 · Class vs Instance Attributes — The Mutable Trap
-
-Here is one of the most common OOP bugs in Python. Read carefully.
+Attributes can live in two places: on the **instance** (in `instance.__dict__`)
+or on the **class** (in `Class.__dict__`, shared by every instance). Attribute
+*lookup* checks the instance first, then falls back to the class. That fallback
+is useful for constants — and a landmine for mutables.
 
 ```{python}
-# ❌  THE TRAP — do not copy this pattern
+# ❌  THE TRAP — do not copy this
 
 class BadRegistry:
-    all_lots = []   # class attribute — shared across ALL instances!
+    seen_lots = []          # lives on the CLASS, shared by all instances
 
     def __init__(self, lot_id):
         self.lot_id = lot_id
-        self.all_lots.append(lot_id)   # mutates the class-level list
+        self.seen_lots.append(lot_id)   # mutates the ONE shared list
 
 
 r1 = BadRegistry("L001")
 r2 = BadRegistry("L002")
 r3 = BadRegistry("L003")
 
-print(r2.all_lots)   # ['L001', 'L002', 'L003'] — r2 sees everyone's lots!
-print(r1.all_lots is r3.all_lots)   # True — same object
+print("r2 sees:", r2.seen_lots)             # ['L001','L002','L003'] — everyone's!
+print("same object?", r1.seen_lots is r3.seen_lots)  # True
 ```
 
-The list `all_lots` lives on the *class*, not on any instance.
-Every instance shares the same list and appends to it.
-This causes subtle data corruption that can take hours to debug.
-
-**The fix: initialise mutable state in `__init__`.**
+Now the mechanism is obvious, not mysterious: `seen_lots` is never written into
+any instance's `__dict__`. Every `self.seen_lots` lookup misses the instance and
+finds the *single* list on the class, and they all append to it. The fix is to
+give each instance its own list, in `__init__`:
 
 ```{python}
 # ✅  The fix
 
 class GoodRegistry:
     def __init__(self, lot_id):
-        self.lot_id  = lot_id
-        self.all_lots = []             # instance attribute — fresh per object
-        self.all_lots.append(lot_id)
+        self.lot_id    = lot_id
+        self.seen_lots = []                 # fresh list per instance
+        self.seen_lots.append(lot_id)
 
 
-r1 = GoodRegistry("L001")
-r2 = GoodRegistry("L002")
-
-print(r1.all_lots)   # ['L001']
-print(r2.all_lots)   # ['L002']
-print(r1.all_lots is r2.all_lots)   # False — separate objects
+g1 = GoodRegistry("L001")
+g2 = GoodRegistry("L002")
+print("g1:", g1.seen_lots, " g2:", g2.seen_lots)   # ['L001']  ['L002']
+print("same object?", g1.seen_lots is g2.seen_lots)  # False
 ```
 
-**Rule:** Mutable defaults (lists, dicts, sets) always go in `__init__`.
-Immutable class attributes (constants, strings) are fine at the class level.
+**Rule:** immutable shared values (constants, a default string) are fine as class
+attributes; **mutable defaults (list, dict, set) must be created in `__init__`.**
+You'll meet this exact hazard again on Day 4 with `@dataclass`, where the cure is
+`field(default_factory=list)` — same disease, same shape, different syntax.
 
-*We'll see the same trap with `@dataclass` and `field(default_factory=...)` on Day 4.*
+### Methods — Task A and Task B, now coupled to provenance
 
----
-
-## 5 · Adding Methods
-
-Methods are just functions defined inside a class. The first parameter is
-always `self` — the instance the method is called on.
+A method is just a function defined in the class body whose first parameter is
+the instance. The payoff: the transform and the metadata now move together, and
+the result is *another* `WaferDataset` that still knows its origin.
 
 ```{python}
 class WaferDataset:
@@ -219,51 +316,83 @@ class WaferDataset:
         self.data       = data
         self.source     = source
         self.lot_id     = lot_id
-        self.fetched_at = fetched_at if fetched_at is not None else datetime.now()
+        self.fetched_at = fetched_at or datetime.now()
 
     def summary(self):
-        """Descriptive statistics of all numeric columns."""
+        """Descriptive stats of the numeric columns."""
         return self.data.describe()
 
-    def filter_device(self, device_type):
-        """Return a new WaferDataset containing only rows for *device_type*."""
+    def filter_device(self, device_type):           # Task B
         mask = self.data["device_type"] == device_type
         return WaferDataset(
-            data=self.data.loc[mask].copy(),   # .copy() prevents pandas warning
+            data=self.data.loc[mask].copy(),         # .copy(): see note below
             source=self.source,
             lot_id=self.lot_id,
-            fetched_at=self.fetched_at,        # filtered data shares the same timestamp
+            fetched_at=self.fetched_at,              # carry provenance forward
+        )
+
+    def filter_lots(self, lot_ids):                  # Task A
+        mask = self.data["lot_id"].isin(lot_ids)
+        remaining = lot_ids[0] if len(lot_ids) == 1 else None
+        return WaferDataset(
+            data=self.data.loc[mask].copy(),
+            source=self.source,
+            lot_id=remaining,
+            fetched_at=self.fetched_at,
         )
 ```
 
 ```{python}
-ds = WaferDataset(df_l001, "sqlite:electrical.db", "L001")
+ds = WaferDataset(df_all, "sqlite:electrical.db", lot_id=None)
 
-tft_ds = ds.filter_device("TFT")
-print(f"All rows: {len(ds.data)}")
-print(f"TFT rows: {len(tft_ds.data)}")
-print(f"Original unchanged: {len(ds.data)}")   # still the full set
+# Task A then Task B — each step returns a WaferDataset, not a bare frame:
+review = ds.filter_lots(["L001", "L003"]).filter_device("TFT")
 
-tft_ds.summary()
+print("original rows:", len(ds.data))      # unchanged
+print("review rows:  ", len(review.data))
+print("review source:", review.source)     # provenance survived both filters
 ```
 
-Two improvements over the procedural version:
+Two design choices to call out, because they're the whole point:
 
-1. The method lives *with* the data — no separate function namespace to remember.
-2. `filter_device` returns a *new* `WaferDataset`, keeping the pattern consistent.
+1. **Every filter returns a new `WaferDataset` and never mutates `self`.** That's
+   a *functional* style layered on top of mutable pandas. The `.copy()` is what
+   makes it honest: without it, the slice could share memory with the parent and
+   a later edit would silently reach back and change the original (and pandas
+   would warn). Immutability-by-convention makes chains like the one above safe
+   to reason about.
+2. **Provenance is threaded through automatically.** This is Task C, solved. A
+   filtered dataset cannot lose track of its `source` or `fetched_at`, because
+   the only way to make one is through a method that copies them forward. The
+   dict approach *let* you forget; the class makes forgetting impossible.
 
----
+> **Bound methods, briefly.** `ds.filter_device` is a *bound method* — the
+> function `WaferDataset.filter_device` with `ds` pre-bound as `self`. These two
+> lines are identical:
+>
+> ```python
+> ds.filter_device("TFT")
+> WaferDataset.filter_device(ds, "TFT")
+> ```
+>
+> That equivalence is all "methods" really are. No magic.
 
-## 6 · `__repr__` — Give Your Objects a Voice
+### `__repr__` (and its sibling `__str__`)
 
-When you print or inspect an object without `__repr__`, Python gives you something like:
+Without `__repr__`, inspecting an object gives you a memory address — useless in
+a data workflow where you're constantly eyeballing intermediate results:
 
+```{python}
+class Bare:
+    pass
+print(Bare())     # <__main__.Bare object at 0x...> — tells you nothing
 ```
-<__main__.WaferDataset object at 0x7f3b2c1d4a10>
-```
 
-That's a memory address, which tells you nothing useful. Add `__repr__` and
-you get a *programmer-facing description* of the object's state.
+`__repr__` is the **developer-facing** description. The convention (the "repr
+contract") is that it should be unambiguous and, ideally, look like the code that
+would recreate the object. `__str__` is the **user-facing** description; if you
+don't define it, `str()` and `print()` fall back to `__repr__`. For a data tool,
+a single good `__repr__` is usually all you need.
 
 ```{python}
 class WaferDataset:
@@ -271,12 +400,12 @@ class WaferDataset:
         self.data       = data
         self.source     = source
         self.lot_id     = lot_id
-        self.fetched_at = fetched_at if fetched_at is not None else datetime.now()
+        self.fetched_at = fetched_at or datetime.now()
 
     def __repr__(self):
         return (
             f"WaferDataset("
-            f"lot={self.lot_id!r}, "       # !r wraps strings in quotes
+            f"lot={self.lot_id!r}, "        # !r -> calls repr(), so strings get quotes
             f"rows={len(self.data)}, "
             f"source={self.source!r})"
         )
@@ -286,75 +415,133 @@ class WaferDataset:
 
     def filter_device(self, device_type):
         mask = self.data["device_type"] == device_type
-        return WaferDataset(
-            data=self.data.loc[mask].copy(),
-            source=self.source,
-            lot_id=self.lot_id,
-            fetched_at=self.fetched_at,
-        )
+        return WaferDataset(self.data.loc[mask].copy(), self.source,
+                            self.lot_id, self.fetched_at)
 ```
 
 ```{python}
-ds = WaferDataset(df_l001, "sqlite:electrical.db", "L001")
-print(ds)      # WaferDataset(lot='L001', rows=225, source='sqlite:electrical.db')
-ds             # Same in a Jupyter/Quarto cell — no more memory address
+ds = WaferDataset(df_all[df_all.lot_id == "L001"].copy(),
+                  "sqlite:electrical.db", "L001")
+print(ds)                       # WaferDataset(lot='L001', rows=225, source='sqlite:electrical.db')
+print(ds.filter_device("TFT"))  # WaferDataset(lot='L001', rows=75, source='sqlite:electrical.db')
 ```
 
-```{python}
-tft_ds = ds.filter_device("TFT")
-print(tft_ds)   # WaferDataset(lot='L001', rows=75, source='sqlite:electrical.db')
-```
-
-`__repr__` pays dividends in loops, logs, and interactive sessions.
+The `!r` matters: it makes the repr show `lot='L001'` (quoted, unambiguous)
+rather than `lot=L001` (is that a string? a variable?). In loops, logs, and
+interactive sessions this difference is the gap between "I can see what I have"
+and "I'm printing memory addresses again."
 
 ---
 
-## 7 · Using the Installed Package
+## When **not** to reach for a class
 
-We've just built `WaferDataset` by hand to understand every line. The polished
-version lives in `fab_toolkit` (installed via `uv sync --extra dev`). Let's use
-it to peek at the LOT003 Vth shift that motivates the whole course.
+This is the section the rest of the course assumes but rarely says out loud.
+Classes are a tool, not a virtue. Reaching for one reflexively produces code
+that's *harder* to read than the procedural version. Here's how to decide.
+
+### A decision checklist
+
+Reach for a **class** when **several** of these are true:
+
+- **State + behaviour travel together.** The data and the operations on it
+  belong as one unit (our `WaferDataset`: a frame + how you filter/summarise it).
+- **There are invariants to protect.** Something must stay consistent — here,
+  *provenance must survive every transform.* If you find yourself writing "and
+  don't forget to also update X", a class can make X impossible to forget.
+- **You'll have multiple independent instances** with their own state.
+- **You want a stable interface that hides representation.** Callers shouldn't
+  care that it's SQLite underneath (this is the seam Day 3's `DataSource` widens,
+  so swapping in a real database later is trivial).
+- **You'll want polymorphism** — different things responding to the same method
+  name (Day 3).
+
+Stick with a **plain function** (or a module of them — your `get_data.py`) when:
+
+- The operation is a **stateless transform**: frame in, frame out, no memory.
+  *Our `filter_lots`/`filter_devices` started here and were completely fine.*
+- You'll reuse it across **many** unrelated data shapes. A free function
+  `filter_lots(df, ids)` works on any frame; a method only works on a
+  `WaferDataset`.
+- There's **no invariant** that needs guarding.
+
+Reach for a **`@dataclass`** (Day 4) when you mostly need to *hold* related
+fields with free `__init__`/`__repr__`/`__eq__` and little behaviour — config
+objects, spec limits.
+
+And sometimes the right answer is **just a DataFrame** (or a dict): if a wrapper
+buys you nothing, don't add one.
+
+### Smells that you've over-classed
+
+- **The namespace class.** Every method is `@staticmethod`, there's no real
+  `self` state — you've written a module with extra steps. Use a module.
+- **The script-in-a-class.** `__init__` does all the work and there's one
+  `run()` method. That's a procedure wearing a costume; write functions.
+- **Premature wrapping.** You built a class before you had two call sites. Wait
+  for the second use; let the abstraction be *pulled* out of real duplication,
+  not pushed in speculatively.
+- **Getter/setter soup.** A `get_x`/`set_x` pair for every field that does
+  nothing but read and write it. In Python, expose the attribute; introduce
+  `@property` (Day 4) *only* when you have real validation or computation.
+
+### So why does `WaferDataset` survive the test?
+
+Be skeptical of our own class for a second. Its filters are stateless transforms
+— by the checklist, those alone would argue for plain functions. What tips it
+over is **Task C, the invariant**: *a dataset must never be separated from its
+provenance, even after arbitrary filtering.* The class is the cheapest way to
+make that guarantee structural rather than a thing you remember. Take the
+invariant away and honestly, `filter_lots(df, ids)` would be the better design.
+
+Keep your `get_data.py` helpers. They're not a failure of OOP discipline —
+they're the right tool for stateless extract-and-reshape. The class earns its
+keep at exactly the point where *consistency under transformation* starts to
+matter.
+
+---
+
+## Using the installed package
+
+Everything above we built by hand to see the mechanics. The polished version
+lives in `fab_toolkit` (installed via `uv sync --extra dev`) and is what the
+later days build on. Let's use it to look at the planted signal that drives the
+whole course.
 
 ```{python}
-from fab_toolkit import WaferDataset as WDS
+from fab_toolkit import WaferDataset
 
 conn = sqlite3.connect(DB_PATH)
-df_l003 = pd.read_sql("SELECT * FROM electrical WHERE lot_id = 'L003'", conn)
+df = pd.read_sql("SELECT * FROM electrical", conn)
 conn.close()
 
-ds_l003 = WDS(df_l003, source="sqlite:electrical.db", lot_id="L003")
-tft_l003 = ds_l003.filter_device("TFT")
+ds = WaferDataset(df, source="sqlite:electrical.db", lot_id=None)
+print(ds)
 
-print(ds_l003)
-print(tft_l003)
+# Task A + B together, via the real toolkit:
+l3_tft = ds.filter_lots(["L003"]).filter_device("TFT")
+print(l3_tft)
 ```
 
 ```{python}
-# Compare mean Vth across lots — LOT003 TFT should be ~0.05 V higher.
-conn = sqlite3.connect(DB_PATH)
-summary = pd.read_sql("""
-    SELECT lot_id,
-           ROUND(AVG(vth), 4)  AS mean_vth,
-           ROUND(STDEV(vth), 4) AS std_vth,
-           COUNT(*)             AS n
-    FROM electrical
-    WHERE device_type = 'TFT'
-    GROUP BY lot_id
-    ORDER BY lot_id
-""", conn)
-conn.close()
-
-summary
+# Mean TFT Vth per lot — one of these lots is not like the others.
+tft = ds.filter_device("TFT")
+(
+    tft.data
+    .groupby("lot_id")["vth"]
+    .agg(mean_vth="mean", std_vth="std", n="count")
+    .round(4)
+)
 ```
 
 ```{python}
-# Quick visual — we'll build proper wafer maps in Day 5.
+# A first look (proper wafer maps come in Day 5).
 try:
     from plotnine import ggplot, aes, geom_boxplot, labs, theme_bw
     p = (
-        ggplot(df_all[df_all["device_type"] == "TFT"], aes("lot_id", "vth", fill="lot_id"))
+        ggplot(tft.data, aes("lot_id", "vth", fill="lot_id"))
         + geom_boxplot(show_legend=False)
-        + labs(title="TFT Vth by Lot — spot the outlier", x="Lot", y="Vth (V)")
+        + labs(title="TFT Vth by lot — spot the outlier",
+               x="Lot", y="Vth (V)")
         + theme_bw()
     )
     p.draw()
@@ -362,44 +549,44 @@ except ImportError:
     print("plotnine not installed — skipping plot")
 ```
 
-LOT003 stands out clearly. The question the capstone answers is: *why?*
-(Spoiler: a process-timing drift in chamber C2.)
+L003 sits clearly high. *Why* is the question the capstone answers (a process
+chamber whose etch step runs long) — but already you have a tidy object that
+knows what it holds and where it came from.
 
 ---
 
-## 8 · Summary
+## Summary
 
-Today you built `WaferDataset` from scratch:
+| Concept | What it is | Why you care here |
+|---|---|---|
+| `class` | A factory for instances | One blueprint, many datasets |
+| `__init__` | Initialiser, not constructor | Sets up per-instance attributes |
+| `self` | The instance, passed explicitly | `obj.m()` ≡ `Class.m(obj)` |
+| instance vs class attr | Stored in instance vs class `__dict__` | Explains the mutable-default trap |
+| method | Function bound to an instance | Couples a transform to its data + provenance |
+| `__repr__` / `__str__` | Dev-facing / user-facing text | Readable objects in logs and notebooks |
 
-| Concept | What it does |
-|---|---|
-| `class` | Defines the blueprint |
-| `__init__` | Initialises per-instance state; called automatically |
-| `self` | The instance itself; gives you per-object attribute storage |
-| Class attribute | Shared across all instances — dangerous with mutables |
-| Instance attribute | Set in `__init__`; private to each object |
-| Method | A function attached to the class; `self` is always first |
-| `__repr__` | Controls what `print(obj)` shows |
-
-**Why the class earns its keep over a dict:**
-
-1. Typos fail at `__init__` time, not later when you try to access a key.
-2. Methods bundle logic with data — no free-floating functions to track.
-3. `__repr__` gives instant readable state — essential in data workflows.
+**The one-line takeaway:** a class earns its keep when *data, behaviour, and an
+invariant must stay coupled and consistent.* For `WaferDataset` the invariant is
+provenance-survives-filtering. Absent an invariant, your procedural helpers are
+the better, simpler choice — and knowing the difference is the actual skill.
 
 ---
 
-## What's Next (Day 2)
+## What's next (Day 2)
 
-`WaferDataset` still requires callers to build a DataFrame before constructing
-it. On **Day 2** we fix that with `@classmethod` alternate constructors:
+`WaferDataset` still makes the caller open the database and build the frame
+first. On **Day 2** we push that responsibility *into* the class with
+`@classmethod` alternate constructors, so the scenarios from today get a clean
+front door:
 
 ```python
-# Day 2 preview:
-ds = WaferDataset.from_sqlite("data/electrical.db", lot_id="L001")
-ds = WaferDataset.from_parquet("data/lot1.parquet")
-ds = WaferDataset.from_csv("data/lot1.csv")
+# Day 2 preview — the "since date X" and "from a file" jobs become one-liners:
+ds = WaferDataset.from_sqlite("data/electrical.db", lots=["L001", "L003"])
+ds = WaferDataset.from_parquet("data/snapshot.parquet")
+ds = WaferDataset.from_csv("final_v2.csv")
 ```
 
-We'll also explore the Python **data model** — `__len__`, `__getitem__`,
-`__iter__`, `__eq__` — to make `WaferDataset` feel like a native Python object.
+We'll also implement the **data model** dunders — `__len__`, `__getitem__`,
+`__iter__`, `__eq__`, `__contains__` — so a `WaferDataset` behaves like a native
+Python container: `len(ds)`, `ds["vth"]`, `for chunk in ds`, `ds1 == ds2`.

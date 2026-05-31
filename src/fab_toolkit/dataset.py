@@ -63,3 +63,22 @@ class WaferDataset:
             lot_id=self.lot_id,
             fetched_at=self.fetched_at,
         )
+
+    def filter_lots(self, lot_ids: list[str]) -> WaferDataset:
+        """Return a new WaferDataset containing only rows for the given lots.
+
+        Useful when a dataset spans many lots and a review narrows to a subset,
+        e.g. ``ds.filter_lots(["L001", "L003"])``. The returned dataset carries
+        a concrete ``lot_id`` only when a single lot remains; otherwise it stays
+        ``None`` to signal a multi-lot dataset. Provenance (``source``,
+        ``fetched_at``) is preserved so the subset never loses track of where it
+        came from.
+        """
+        mask = self.data["lot_id"].isin(lot_ids)
+        remaining_lot = lot_ids[0] if len(lot_ids) == 1 else None
+        return WaferDataset(
+            data=self.data.loc[mask].copy(),
+            source=self.source,
+            lot_id=remaining_lot,
+            fetched_at=self.fetched_at,
+        )
