@@ -1,0 +1,249 @@
+---
+title: "Day 2 — Methods & the Data Model: `WaferDataset` as a Container"
+subtitle: "Real Python OOP course · semiconductor edition"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+execute:
+  echo: true
+  eval: true
+  warning: false
+jupyter: python3
+---
+
+## The gap from Day 1
+
+`ElectricalDB.fetch_device()` returns a plain pandas DataFrame. That's fine — you
+know how to work with DataFrames. But the moment you pass one to a function, save
+it to parquet and reload it, or hand it to a colleague, the context disappears:
+which lots? which device type? which DB?
+
+Day 2 builds `WaferDataset` as a **result container**: a thin wrapper that adds
+a source label, a consistent construction API, and just enough Python magic to
+make it behave like a native container. The emphasis today is on **how pandas
+and classes fit together** — not how pandas works.
+
+```{python}
+import sqlite3
+from pathlib import Path
+import pandas as pd
+from fab_toolkit import ElectricalDB
+
+DB_PATH = Path("../../data/electrical.db")
+db = ElectricalDB(DB_PATH)
+```
+
+---
+
+## 1 · `@classmethod` alternate constructors
+
+A class can have multiple ways to be built. The pattern is:
+
+```python
+@classmethod
+def from_something(cls, ...):
+    # build data somehow
+    return cls(data, source=...)
+```
+
+`cls` is the class itself (not an instance). Calling `cls(...)` is the same as
+calling `WaferDataset(...)` — it invokes `__init__`. Using `cls` rather than
+hardcoding the class name means subclasses inherit the constructor for free.
+
+```{python}
+from fab_toolkit import WaferDataset
+
+# Three ways to construct the same logical object:
+
+# 1. From an ElectricalDB query
+ds_db = WaferDataset.from_db(db, lots=["L001", "L003"], device_type="TFT")
+print(ds_db)
+
+# 2. From parquet (typical: load a previously cached query)
+pq_path = Path("../../data/cache/tft_l001_l003.parquet")
+pq_path.parent.mkdir(exist_ok=True)
+ds_db.data.to_parquet(pq_path)
+ds_pq = WaferDataset.from_parquet(pq_path)
+print(ds_pq)
+
+# 3. From CSV
+csv_path = Path("../../data/cache/tft_l001_l003.csv")
+ds_db.data.to_csv(csv_path, index=False)
+ds_csv = WaferDataset.from_csv(csv_path)
+print(ds_csv)
+```
+
+All three end up with the same data. What's different is the `source` label,
+which travels with the object.
+
+### `@classmethod` vs `@staticmethod` vs instance method
+
+| Kind | First arg | Has access to | When to use |
+|---|---|---|---|
+| instance method | `self` (the instance) | instance state | most methods |
+| `@classmethod` | `cls` (the class) | class + can call `cls(...)` | alternate constructors |
+| `@staticmethod` | nothing | nothing | utility namespaced to the class |
+
+`ElectricalDB.load_parquet()` from Day 1 is a `@staticmethod` — it reads a file
+and doesn't need to know anything about the DB. `WaferDataset.from_parquet()` is
+a `@classmethod` — it needs `cls` to call `cls(df, source=...)` and return the
+right type.
+
+---
+
+## 2 · `__len__`, `__getitem__`, `__contains__`
+
+These dunders make `WaferDataset` behave like a Python collection. The
+implementation delegates to the underlying DataFrame — the interesting part is
+*choosing what the delegation means*.
+
+```{python}
+ds = WaferDataset.from_db(db, device_type="TFT")
+
+# __len__: number of measurement rows
+print(len(ds))            # 375
+
+# __getitem__: column access and boolean masks — delegates to pandas
+print(ds["vth"].describe())
+
+# multi-column slice
+print(ds[["lot_id", "wafer_id", "vth"]].head(3))
+
+# boolean mask
+flagged = ds[ds["vth_flag"]]
+print(f"Flagged rows: {len(flagged)}")
+
+# __contains__: lot membership
+print("L003" in ds)       # True
+print("L999" in ds)       # False
+```
+
+`__getitem__` here is intentionally thin — it's just `return self.data[key]`.
+That's the right choice when the wrapper's job is *augmenting* pandas rather
+than replacing it. If you find yourself reimplementing `.loc`, `.iloc`, `.query`
+inside the class, step back and ask whether the wrapper is adding value.
+
+---
+
+## 3 · `__iter__`
+
+What does it mean to iterate over a `WaferDataset`? That's a design choice.
+Row-level iteration is `self.data.itertuples()` — almost never what you want in
+pandas. In a fab context the natural unit of iteration is a **wafer**, so
+`__iter__` yields per-wafer sub-DataFrames:
+
+```{python}
+ds_l001 = WaferDataset.from_db(db, lots=["L001"], device_type="TFT")
+
+# Iterate over wafers and compute per-wafer Vth mean
+wafer_means = []
+for wafer_df in ds_l001:
+    wafer_means.append({
+        "lot_id":   wafer_df["lot_id"].iloc[0],
+        "wafer_id": wafer_df["wafer_id"].iloc[0],
+        "mean_vth": wafer_df["vth"].mean(),
+    })
+
+pd.DataFrame(wafer_means).head()
+```
+
+Note the tension: `len(ds)` counts rows, but `len(list(ds))` counts wafers.
+This asymmetry is a deliberate trade-off documented in the docstring. If you
+want chunk-based iteration for large datasets (not the case here), you'd add
+a `chunks(n)` method rather than overloading `__iter__` with a `chunk_size`
+parameter — `__iter__` can't take default arguments.
+
+---
+
+## 4 · `__eq__`
+
+Without `__eq__`, Python compares by identity (memory address). For a result
+container you usually want to compare by content:
+
+```{python}
+# Same data, same source — equal
+ds_a = WaferDataset.from_db(db, lots=["L001"], device_type="TFT")
+ds_b = WaferDataset.from_db(db, lots=["L001"], device_type="TFT")
+print(ds_a == ds_b)    # True — data.equals() + source match
+
+# Different source label — not equal
+ds_c = WaferDataset(ds_a.data.copy(), source="something_else")
+print(ds_a == ds_c)    # False
+```
+
+Return `NotImplemented` (not `False`) when the other operand isn't a
+`WaferDataset`. Python then tries the reflected operation on the other object,
+which is the correct behaviour for custom equality.
+
+---
+
+## 5 · Working with the container
+
+Putting it together — typical usage pattern:
+
+```{python}
+from pathlib import Path
+
+CACHE = Path("../../data/cache/all_tft.parquet")
+
+# Load from cache if it exists; query and cache if not.
+if CACHE.exists():
+    ds = WaferDataset.from_parquet(CACHE)
+else:
+    ds = WaferDataset.from_db(db, device_type="TFT")
+    ds.data.to_parquet(CACHE, index=False)
+
+print(ds)
+print(f"Lots: {ds.lots()}")
+print(f"Rows: {len(ds)}")
+print(f"L003 in dataset: {'L003' in ds}")
+```
+
+```{python}
+# Column slicing
+vth_by_lot = (
+    ds["vth"]
+    .groupby(ds.data["lot_id"])
+    .mean()
+    .round(4)
+)
+print(vth_by_lot)
+```
+
+The LOT003 elevation we saw in Day 1 is still there — same data, cleaner
+interface.
+
+---
+
+## 6 · Tradeoffs
+
+**When `WaferDataset` earns its keep:**
+
+- You want a single consistent entry point (`from_db`, `from_parquet`, `from_csv`)
+  with the source label always set correctly.
+- The `__iter__` semantic (wafer-level) is genuinely useful and worth encoding
+  once rather than writing `groupby(["lot_id","wafer_id"])` everywhere.
+- You'll add more methods here in Day 4 (spec-based filtering, yield KPIs).
+
+**When it's overkill:**
+
+- You fetched the data once, analyse it once, and throw it away — a plain
+  DataFrame is simpler.
+- The "source" label adds no value in your workflow (you always know where data
+  came from via your notebook structure).
+
+The `from_*` constructors are the strongest argument. Even if you never use
+`__iter__` or `__contains__`, having one place that builds the DataFrame *and*
+records where it came from is usually worth a thin class.
+
+---
+
+## What's next — Day 3
+
+`ElectricalDB` and `ProcessSource` currently know nothing about each other.
+Day 3 introduces an **abstract base class** (`DataSource`) that both implement,
+and a **`Pipeline`** that *composes* them — showing the inheritance-vs-composition
+choice in a realistic context.

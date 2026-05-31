@@ -1,0 +1,279 @@
+---
+title: "Day 4 — Properties, Dataclasses & SOLID"
+subtitle: "Real Python OOP course · semiconductor edition"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+execute:
+  echo: true
+  eval: true
+  warning: false
+jupyter: python3
+---
+
+## Overview
+
+Four concepts today that each solve a concrete problem:
+
+1. **`@property`** — computed attributes and validated setters, without getter/setter boilerplate
+2. **`@dataclass`** — config and value objects, free `__init__`/`__repr__`/`__eq__`, and the right way to handle mutable defaults
+3. **`field(default_factory=...)`** — the `@dataclass` fix for the Day 1 mutable trap
+4. **SOLID** — five design principles, two shown in code, three named and placed
+
+```{python}
+from pathlib import Path
+import pandas as pd
+from fab_toolkit import ElectricalDB, WaferDataset
+
+DB_PATH = Path("../../data/electrical.db")
+db = ElectricalDB(DB_PATH)
+tft = WaferDataset.from_db(db, device_type="TFT")
+```
+
+---
+
+## 1 · `@property`
+
+Without `@property`, you have two bad options for a computed attribute:
+
+```python
+# Option A: recompute on every call — fine but verbose at call sites
+analysis.compute_yield()
+
+# Option B: store it and keep it in sync manually — error-prone
+analysis.yield_pct = ...  # who updates this when data changes?
+```
+
+`@property` gives you option C: **compute on access, look like an attribute**.
+
+```{python}
+from fab_toolkit import SpecLimits, VthAnalysis
+
+spec = SpecLimits("vth", lower=0.40, upper=0.46)
+analysis = VthAnalysis(tft.data, spec)
+
+# Access looks like an attribute — no () needed:
+print(f"Yield:   {analysis.yield_pct:.1f}%")
+print(f"Fails:   {analysis.n_fails}")
+print(analysis)
+```
+
+`yield_pct` is computed fresh each time it's accessed — there's no stored value
+that can go stale. This is the right choice here because `_data`, `_lower`, and
+`_upper` can change.
+
+### Setters that validate
+
+The canonical use case for a setter is rejecting invalid state at the point of
+assignment:
+
+```{python}
+# Tighten the spec — instant update to yield_pct
+print(f"Before: lower={analysis.lower}, yield={analysis.yield_pct:.1f}%")
+
+analysis.lower = 0.40
+print(f"After:  lower={analysis.lower}, yield={analysis.yield_pct:.1f}%")
+```
+
+```{python}
+# Try to set an invalid range — should raise immediately
+try:
+    analysis.lower = 0.60   # >= upper
+except ValueError as e:
+    print(f"Caught: {e}")
+```
+
+The setter validates before storing. Without it, an invalid lower/upper pair
+would only cause a silent wrong answer in `yield_pct`, far from where the
+mistake was made.
+
+### When NOT to use `@property`
+
+Don't wrap every attribute. Use `@property` only when:
+- **Computation is needed**: the value is derived from other state.
+- **Validation is needed**: the setter should reject invalid values.
+- **Read-only enforcement**: expose a private attribute without a setter.
+
+If the attribute is just stored and retrieved, expose it directly (`self.x`).
+A bare attribute is clearer and cheaper than a no-op property.
+
+---
+
+## 2 · `@dataclass` — value objects and config
+
+`@dataclass` generates `__init__`, `__repr__`, and `__eq__` from field
+declarations. It's the right tool for **data-holding** objects with minimal behaviour:
+
+```{python}
+from fab_toolkit import SpecLimits, KpiSpec, PrepConfig
+
+# frozen=True: immutable + hashable + explicit that this is a value object
+spec = SpecLimits("vth", lower=0.40, upper=0.46)
+print(spec)                    # SpecLimits(parameter='vth', lower=0.40, upper=0.46)
+print(spec == SpecLimits("vth", 0.40, 0.46))   # True — @dataclass __eq__
+
+kpi = KpiSpec("vth_spec", spec)
+print(kpi)
+```
+
+```{python}
+# PrepConfig is mutable (not frozen) — for building up a job config
+cfg = PrepConfig()
+cfg.lots.extend(["L001", "L003"])
+cfg.since = "2024-01-10"
+print(cfg)
+```
+
+### `field(default_factory=...)` — the Day 1 trap, solved
+
+Day 1 showed the mutable class-attribute trap. The same problem exists with
+`@dataclass` if you write `lots: list = []`:
+
+```{python}
+from dataclasses import dataclass, field
+
+# ❌ This raises a ValueError at class definition time in Python 3.x:
+# @dataclass
+# class BadConfig:
+#     lots: list = []    # mutable default not allowed — Python catches this
+
+# ✅ The fix:
+@dataclass
+class GoodConfig:
+    lots: list[str] = field(default_factory=list)
+
+a = GoodConfig()
+b = GoodConfig()
+a.lots.append("L001")
+print("a.lots:", a.lots)
+print("b.lots:", b.lots)   # [] — separate instance, factory called per object
+```
+
+Python actually raises a `ValueError` if you try to use a mutable default in a
+dataclass — it catches the trap for you. `field(default_factory=list)` is the
+idiomatic fix. It's conceptually identical to `self.lots = []` in `__init__`.
+
+### When `@dataclass` vs a regular class
+
+Use `@dataclass` when the object is primarily a **bundle of named values**:
+config, spec limits, result structs. Use a regular class when there's
+substantial behaviour or the constructor has non-trivial logic.
+
+`frozen=True` for config/spec objects that should be set once (hashable,
+safe to use as dict keys); leave it out for mutable config builders.
+
+---
+
+## 3 · SOLID
+
+Five principles that describe well-designed OOP code. All five are present in
+`fab_toolkit`; two are worth demonstrating in code.
+
+### S — Single Responsibility
+
+Each class has one reason to change:
+- `ElectricalDB`: query building and device processing. If the SQL schema changes,
+  this changes.
+- `Pipeline`: join logic. If the aggregation strategy changes, this changes.
+- `VthAnalysis`: spec-checking logic. If the KPI definition changes, this changes.
+
+They don't change for the same reasons.
+
+### O — Open/Closed: open for extension, closed for modification
+
+```{python}
+from fab_toolkit import HTMLRenderer, MarkdownRenderer, ReportRenderer
+
+sections = {
+    "LOT003 Vth Excursion": "L003 mean Vth = 0.447 V (baseline ~0.428 V)",
+    "Root Cause": "ETCH_GATE step_seconds drift on chamber C2",
+}
+
+html_out = HTMLRenderer().render(sections)
+md_out   = MarkdownRenderer().render(sections)
+
+print(html_out[:120])
+print("---")
+print(md_out[:120])
+```
+
+```{python}
+# Adding a new format = add a new subclass. No existing code is edited.
+import json
+
+class JSONRenderer(ReportRenderer):
+    def render(self, sections: dict[str, str]) -> str:
+        return json.dumps(sections, indent=2)
+
+print(JSONRenderer().render(sections)[:120])
+```
+
+`JSONRenderer` didn't touch `ReportRenderer`, `HTMLRenderer`, or `MarkdownRenderer`.
+The `save()` method it inherited from `ReportRenderer` works automatically.
+
+### L — Liskov Substitution
+
+Any `DataSource` subclass can replace any other in a `Pipeline` and the Pipeline
+still works correctly. Day 3's stub test proved this: `StubElectrical` has no
+inheritance relationship with `ElectricalSource` but satisfies the same contract.
+
+### I — Interface Segregation
+
+`DataSource` exposes one method: `fetch()`. Callers only depend on what they use.
+If we'd put device-specific processing into `DataSource`, `ProcessSource` would
+have to implement methods that make no sense for it.
+
+### D — Dependency Inversion
+
+High-level modules should depend on abstractions, not concrete implementations.
+
+```{python}
+from fab_toolkit import Pipeline, ElectricalSource, ProcessSource, DataSourceProto
+
+# Pipeline depends on DataSource (the abstraction), not ElectricalDB (the detail).
+# You can pass anything with a fetch() method:
+
+ELEC_DB = Path("../../data/electrical.db")
+PROC_DB = Path("../../data/process.db")
+
+pipeline = Pipeline(
+    ElectricalSource(ELEC_DB),   # could be swapped for RemoteElectricalSource
+    ProcessSource(PROC_DB),      # without changing Pipeline at all
+)
+
+joined = pipeline.run()
+print(joined.shape)
+```
+
+The concrete sources are injected at construction time. `Pipeline` never imports
+`ElectricalDB` — it imports `DataSource`. This is the **seam** that makes the
+"swap SQLite for a real database" migration trivial: write a new `DataSource`
+subclass, change one line at the call site.
+
+---
+
+## 4 · Putting it together — Vth yield by lot
+
+```{python}
+print(f"\nVth spec: [{spec.lower}, {spec.upper}] V")
+print(f"\nYield by lot (TFT, all wafers):")
+
+for lot_id in sorted(tft.data["lot_id"].unique()):
+    lot_data = tft.data[tft.data["lot_id"] == lot_id]
+    a = VthAnalysis(lot_data, spec)
+    marker = "  ← EXCURSION" if a.yield_pct < 90 else ""
+    print(f"  {lot_id}: {a.yield_pct:.1f}%  ({a.n_fails} fails){marker}")
+```
+
+L003's yield failure and its 27 flagged measurements both point to the same
+root cause — the process timing drift. Day 5 confirms it with a regression.
+
+---
+
+## What's next — Day 5 (Capstone)
+
+All the pieces are in place. Day 5 wires them end-to-end:
+`ElectricalSource + ProcessSource → Pipeline → OLS → wafer map → HTML report`.

@@ -1,0 +1,289 @@
+---
+title: "Day 3 — Inheritance vs Composition: `DataSource`, `Pipeline`, and Why It Matters"
+subtitle: "Real Python OOP course · semiconductor edition"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+execute:
+  echo: true
+  eval: true
+  warning: false
+jupyter: python3
+---
+
+## The design problem
+
+We have two databases — electrical measurements and process step timings — and
+a recurring need to join them. We want to write the join logic once, without
+hardcoding which databases it talks to, so we could swap SQLite for a real
+database later (or mock both sources in tests) without touching the join code.
+
+Two tools solve this:
+
+1. **Abstract Base Class (ABC)** — defines the interface both sources must implement.
+2. **Composition** — the join object *has* two sources rather than *inheriting* from one.
+
+This day is as much about what *not* to do as what to do.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+
+ELEC_DB = Path("../../data/electrical.db")
+PROC_DB = Path("../../data/process.db")
+```
+
+---
+
+## 1 · The inheritance temptation — and why it's wrong
+
+The first instinct when you have two similar classes is to make one inherit the
+other. Suppose we built a `ProcessDataset(WaferDataset)`:
+
+```{python}
+from fab_toolkit import WaferDataset
+
+class ProcessDataset(WaferDataset):
+    """Wrong: inherits WaferDataset just to reuse __len__ and __iter__."""
+    pass
+```
+
+This is the **"is-a" test**: a `ProcessDataset` IS NOT a `WaferDataset`.
+Process steps and electrical measurements have different columns, different
+semantics, and different processing logic. Inheriting just to reuse `__len__`
+and `__iter__` is inheriting an interface you don't own, which means every
+addition to `WaferDataset` ripples into `ProcessDataset` whether it makes sense
+or not.
+
+The Liskov Substitution Principle (LSP) makes this concrete: if you can't
+substitute a `ProcessDataset` everywhere a `WaferDataset` is expected, the
+inheritance is wrong. You can't — `process_steps` rows have no `vth` column.
+
+**The smell:** if you find yourself overriding methods to raise `NotImplementedError`,
+or passing `super().__init__(...)` with dummy arguments, the inheritance is wrong.
+Use composition instead.
+
+---
+
+## 2 · The `DataSource` ABC
+
+The right abstraction is a shared *interface*, not shared *implementation*. Both
+sources need to `fetch(lots, since) -> DataFrame`. That's the contract:
+
+```{python}
+from fab_toolkit import DataSource, ElectricalSource, ProcessSource
+
+# DataSource is abstract — you can't instantiate it directly:
+try:
+    DataSource()
+except TypeError as e:
+    print(f"Can't instantiate abstract class: {e}")
+```
+
+```{python}
+# Concrete implementations:
+elec = ElectricalSource(ELEC_DB)
+proc = ProcessSource(PROC_DB)
+
+print(elec)
+print(proc)
+
+# Both satisfy the same interface:
+print(isinstance(elec, DataSource))
+print(isinstance(proc, DataSource))
+```
+
+```{python}
+# Use them the same way regardless of which database they talk to:
+for src in [elec, proc]:
+    df = src.fetch(lots=["L001"])
+    print(f"{src!r}: {len(df)} rows, cols={list(df.columns[:4])}")
+```
+
+Look at how `ElectricalSource` is implemented — it *composes* the `ElectricalDB`
+from Day 1 rather than replacing it:
+
+```python
+class ElectricalSource(DataSource):
+    def __init__(self, db_path):
+        self._db = ElectricalDB(db_path)   # HAS-A, not IS-A
+
+    def fetch(self, lots=None, since=None):
+        return self._db.fetch(lots=lots)
+```
+
+`ElectricalSource` doesn't need to know anything about SQL — `ElectricalDB`
+already handles that. The ABC just ensures `fetch()` has the right signature.
+If we later swap to a remote database, we write a new `RemoteElectricalSource`
+and nothing downstream changes.
+
+---
+
+## 3 · `Pipeline` — composition in action
+
+`Pipeline` *has* two sources. It doesn't inherit from either. The join logic
+lives in one place and depends only on the `DataSource` interface:
+
+```{python}
+from fab_toolkit import Pipeline
+
+pipeline = Pipeline(elec, proc)
+print(pipeline)
+
+joined = pipeline.run()
+print(f"Joined shape: {joined.shape}")
+print(f"Columns: {list(joined.columns)}")
+joined.head()
+```
+
+```{python}
+# The planted signal is already visible in the join:
+joined.groupby("lot_id")["mean_tft_vth"].mean().round(4)
+```
+
+The key design point: `Pipeline.__init__` takes `DataSource` objects, not
+`ElectricalDB` objects. The type annotation is `DataSource`, not a concrete
+class. This is **Dependency Inversion** (Day 4 explores it further): high-level
+code (the Pipeline) depends on an abstraction, not on implementation details.
+
+The practical payoff — in `test_pipeline.py`, the stub test does this:
+
+```python
+class StubElectrical:
+    def fetch(self, lots=None, since=None):
+        return pd.DataFrame({...})   # tiny in-memory fixture
+
+Pipeline(StubElectrical(), StubProcess()).run()  # works, no SQLite needed
+```
+
+`StubElectrical` doesn't even inherit from `DataSource`. It just has a compatible
+`fetch()` method. Which brings us to...
+
+---
+
+## 4 · `typing.Protocol` — structural subtyping
+
+ABC inheritance (`class ElectricalSource(DataSource)`) is **nominal** subtyping:
+you explicitly declare the relationship. `typing.Protocol` is **structural**:
+any class with the right method signature satisfies the protocol — no `super()`
+needed.
+
+```{python}
+from fab_toolkit import DataSourceProto
+
+# A minimal source that satisfies the protocol without inheriting:
+class CsvSource:
+    def __init__(self, path):
+        self._path = path
+
+    def fetch(self, lots=None, since=None):
+        df = pd.read_csv(self._path)
+        if lots:
+            df = df[df["lot_id"].isin(lots)]
+        return df
+
+src = CsvSource("../../data/cache/tft_l001_l003.csv")
+print(hasattr(src, "fetch"))    # True — satisfies DataSourceProto
+```
+
+`CsvSource` can be passed to `Pipeline` and it works, even though it doesn't
+inherit from `DataSource`. Protocols are lighter for mocking in tests and for
+situations where you can't modify the class to add an inheritance declaration
+(e.g. third-party code).
+
+**When to use ABC vs Protocol:**
+- ABC: when you want to enforce the contract at class definition time, share
+  default implementations via mixin methods, or make the subtype relationship
+  explicit in the code.
+- Protocol: when you're writing library code that shouldn't constrain its
+  callers' class hierarchies, or when you're adapting objects you don't own.
+
+---
+
+## 5 · Lot/Wafer: a pure composition example
+
+The process steps have a natural hierarchy: a `Lot` contains `Wafer`s.
+Composition (not inheritance) is the right model:
+
+```{python}
+class Wafer:
+    def __init__(self, lot_id: str, wafer_id: str) -> None:
+        self.lot_id = lot_id
+        self.wafer_id = wafer_id
+
+    def __repr__(self) -> str:
+        return f"Wafer({self.lot_id}/{self.wafer_id})"
+
+
+class Lot:
+    def __init__(self, lot_id: str) -> None:
+        self.lot_id = lot_id
+        self.wafers: list[Wafer] = []   # HAS-A: a Lot has Wafers
+
+    def add_wafer(self, wafer: Wafer) -> "Lot":
+        self.wafers.append(wafer)
+        return self                     # return self for chaining
+
+    def __len__(self) -> int:
+        return len(self.wafers)
+
+    def __repr__(self) -> str:
+        return f"Lot({self.lot_id!r}, {len(self.wafers)} wafers)"
+
+
+# Build from the join result
+lots = {}
+for _, row in joined.iterrows():
+    lot_id, wafer_id = row["lot_id"], row["wafer_id"]
+    if lot_id not in lots:
+        lots[lot_id] = Lot(lot_id)
+    lots[lot_id].add_wafer(Wafer(lot_id, wafer_id))
+
+for lot in lots.values():
+    print(lot)
+```
+
+`Wafer` is not a `Lot`. A `Lot` has `Wafer`s. If you modelled this with
+`Wafer(Lot)` inheritance you'd be saying "a Wafer is a kind of Lot", which is
+wrong, and you'd have to pass a `lot_id` through to `Lot.__init__` on every
+`Wafer` construction, which is awkward.
+
+---
+
+## 6 · When inheritance IS right
+
+Inheritance earns its keep when:
+
+1. **The "is-a" relationship is genuinely true.** `HTMLRenderer` IS-A
+   `ReportRenderer` (Day 4). Substituting one for the other is semantically valid.
+2. **You want to share implementation, not just interface.** `ReportRenderer`'s
+   `save()` method works for every subclass — you write it once.
+3. **You want to enforce an interface** — ABC makes it impossible to forget to
+   implement `fetch()`.
+
+What inheritance is NOT for: code reuse between unrelated classes. That's what
+composition (and plain functions) are for.
+
+---
+
+## Summary: the one-line rule
+
+> If you can say "A **is a** B and substituting A everywhere B is used makes
+> sense", inherit. Otherwise, compose.
+
+`ElectricalSource` IS-A `DataSource` ✓
+`ProcessDataset` IS-A `WaferDataset` ✗ — compose instead
+`Pipeline` IS-A `DataSource` ✗ — it's a different thing; compose instead
+`Lot` IS-A `Wafer` ✗ — a lot has wafers; use composition
+
+---
+
+## What's next — Day 4
+
+Day 4 adds `@property` (computed/validated attributes), `@dataclass` config
+objects, and the SOLID principles — in particular, how `Pipeline`'s dependence
+on `DataSource` rather than a concrete class is an example of Dependency
+Inversion, and how `ReportRenderer` demonstrates Open/Closed.

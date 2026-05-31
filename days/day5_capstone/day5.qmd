@@ -1,0 +1,259 @@
+---
+title: "Day 5 — Capstone: Extract → Join → Model → Plot → Report"
+subtitle: "Real Python OOP course · semiconductor edition"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    # === PDF / PPTX hook ===
+    # To also render PDF:  add `pdf: default` here and run:
+    #   quarto render days/day5_capstone/day5.qmd --to pdf
+    # To render slides:    add `revealjs: default` and run:
+    #   quarto render days/day5_capstone/day5.qmd --to revealjs
+execute:
+  echo: true
+  eval: true
+  warning: false
+jupyter: python3
+---
+
+## The story so far
+
+Five days of classes, ABCs, dataclasses, and properties all built toward one
+goal: a clean, testable pipeline from raw fab databases to an actionable finding.
+This capstone runs the full workflow — no new OOP concepts, just the toolkit
+doing its job.
+
+**The hypothesis:** a gate-etch timing drift on chamber C2 in LOT003 caused an
+above-spec Vth shift on wafers W10–W18.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+
+ELEC_DB = Path("../../data/electrical.db")
+PROC_DB = Path("../../data/process.db")
+```
+
+---
+
+## 1 · Extract
+
+```{python}
+from fab_toolkit import ElectricalSource, ProcessSource, Pipeline
+
+elec = ElectricalSource(ELEC_DB)
+proc = ProcessSource(PROC_DB)
+
+# Sanity check: each source on its own
+elec_all = elec.fetch()
+proc_all = proc.fetch()
+print(f"Electrical: {elec_all.shape}  columns: {list(elec_all.columns)}")
+print(f"Process:    {proc_all.shape}  columns: {list(proc_all.columns)}")
+```
+
+---
+
+## 2 · Join
+
+`Pipeline` aggregates electrical to per-wafer mean TFT Vth and process to
+per-wafer ETCH_GATE duration, then inner-joins on (lot_id, wafer_id).
+
+```{python}
+pipeline = Pipeline(elec, proc)
+joined = pipeline.run()
+
+print(f"Joined: {joined.shape}  — one row per (lot, wafer)")
+joined.head()
+```
+
+```{python}
+# Distribution of ETCH_GATE duration: LOT003 wafers should stand out
+joined.groupby("lot_id")[["mean_tft_vth", "etch_gate_s"]].agg(["mean", "std"]).round(3)
+```
+
+The signal is clear already: LOT003's `etch_gate_s` mean is ~25 s above the
+other lots, and its `mean_tft_vth` is ~0.05 V higher.
+
+---
+
+## 3 · Model — OLS regression
+
+```{python}
+import statsmodels.formula.api as smf
+
+model = smf.ols("mean_tft_vth ~ etch_gate_s", data=joined).fit()
+print(model.summary().tables[1])   # coefficient table only
+```
+
+```{python}
+# Coefficient and confidence interval in plain numbers
+coef  = model.params["etch_gate_s"]
+ci_lo, ci_hi = model.conf_int().loc["etch_gate_s"]
+pval  = model.pvalues["etch_gate_s"]
+r2    = model.rsquared
+
+print(f"Coefficient:  {coef:.5f} V/s  (95% CI [{ci_lo:.5f}, {ci_hi:.5f}])")
+print(f"p-value:      {pval:.2e}")
+print(f"R²:           {r2:.3f}")
+```
+
+The positive, significant coefficient confirms the direction: longer etch →
+higher Vth. The effect size (~0.002 V per second) is physically plausible for a
+gate-etch process.
+
+---
+
+## 4 · Spec analysis with `VthAnalysis`
+
+```{python}
+from fab_toolkit import ElectricalDB, WaferDataset, SpecLimits, VthAnalysis
+
+db  = ElectricalDB(ELEC_DB)
+tft = WaferDataset.from_db(db, device_type="TFT")
+
+spec = SpecLimits("vth", lower=0.40, upper=0.46)
+print(f"Spec window: [{spec.lower}, {spec.upper}] V\n")
+
+rows = []
+for lot_id in tft.lots():
+    lot_data = tft.data[tft.data["lot_id"] == lot_id]
+    a = VthAnalysis(lot_data, spec)
+    rows.append({"lot_id": lot_id, "yield_pct": round(a.yield_pct, 1), "n_fails": a.n_fails})
+
+pd.DataFrame(rows)
+```
+
+---
+
+## 5 · Wafer map
+
+```{python}
+from plotnine import (
+    ggplot, aes, geom_tile, geom_point,
+    scale_fill_gradient2, scale_color_gradient2,
+    facet_wrap, coord_fixed, labs, theme_bw, theme, element_text
+)
+
+# Per-site mean Vth across all wafers, faceted by lot.
+site_means = (
+    tft.data
+    .groupby(["lot_id", "x", "y"])["vth"]
+    .mean()
+    .reset_index(name="mean_vth")
+)
+
+vth_mid = tft.data["vth"].quantile(0.5)
+
+wafer_map = (
+    ggplot(site_means, aes("x", "y", fill="mean_vth"))
+    + geom_tile(width=18, height=18)
+    + scale_fill_gradient2(
+        low="#2166ac", mid="white", high="#d6604d", midpoint=vth_mid,
+        name="Mean\nVth (V)"
+    )
+    + facet_wrap("lot_id", nrow=1)
+    + coord_fixed()
+    + labs(title="Mean TFT Vth per PCM site — LOT003 is the outlier",
+           x="x (mm)", y="y (mm)")
+    + theme_bw()
+    + theme(figure_size=(14, 3), strip_text=element_text(size=9))
+)
+wafer_map.draw()
+```
+
+---
+
+## 6 · Regression scatter
+
+```{python}
+from plotnine import geom_smooth, scale_color_manual, guides, guide_legend
+
+# Flag the defect lot for visual callout
+joined["group"] = joined["lot_id"].apply(
+    lambda l: "LOT003 (drift)" if l == "L003" else "L001/L002/L004/L005"
+)
+
+scatter = (
+    ggplot(joined, aes("etch_gate_s", "mean_tft_vth", color="group"))
+    + geom_point(size=2.5, alpha=0.8)
+    + geom_smooth(aes(group="1"), method="lm", color="black", se=True, size=0.8)
+    + scale_color_manual(values={"LOT003 (drift)": "#d6604d",
+                                  "L001/L002/L004/L005": "#4393c3"})
+    + labs(
+        title=f"TFT Vth vs ETCH_GATE duration  (R²={r2:.2f}, p={pval:.1e})",
+        x="ETCH_GATE step_seconds (s)", y="Mean TFT Vth (V)", color="Lot group"
+    )
+    + theme_bw()
+    + theme(figure_size=(8, 5))
+)
+scatter.draw()
+```
+
+---
+
+## 7 · Report
+
+The rendering of this `.qmd` file *is* the report — Quarto produces the HTML.
+The `ReportRenderer` classes from Day 4 are used here to emit a brief text
+summary, illustrating the Open/Closed pattern one last time:
+
+```{python}
+from fab_toolkit import MarkdownRenderer, HTMLRenderer
+
+l003_yield = next(r["yield_pct"] for r in rows if r["lot_id"] == "L003")
+baseline_yield = sum(r["yield_pct"] for r in rows if r["lot_id"] != "L003") / 4
+
+summary_sections = {
+    "Finding": (
+        f"LOT003 wafers W10–W18 show a Vth excursion of ~0.05 V above baseline.\n"
+        f"LOT003 yield: {l003_yield:.1f}%  vs baseline average: {baseline_yield:.1f}%."
+    ),
+    "Root cause": (
+        f"ETCH_GATE step_seconds drifted +~25 s on chamber C2 for the affected wafers.\n"
+        f"OLS: Vth = {model.params['Intercept']:.4f} + {coef:.5f} × etch_gate_s "
+        f"(R²={r2:.2f}, p={pval:.1e})."
+    ),
+    "Recommendation": (
+        "Inspect chamber C2 ETCH_GATE recipe; review maintenance log for the\n"
+        "period covering LOT003 processing."
+    ),
+}
+
+# The same sections rendered two ways without touching existing classes:
+print(MarkdownRenderer().render(summary_sections))
+```
+
+```{python}
+# Save an HTML summary alongside the notebook
+from pathlib import Path
+HTMLRenderer().save(summary_sections, Path("lot003_summary.html"))
+print("Saved lot003_summary.html")
+```
+
+---
+
+## What the class hierarchy bought us
+
+| Component | Pattern | Payoff |
+|---|---|---|
+| `ElectricalDB` | class with state + methods | SQL filter building in one place; swappable DB path |
+| `WaferDataset` | @classmethod constructors + dunders | Consistent construction from any source; native container feel |
+| `DataSource` ABC | abstract base class | Enforces the fetch() contract; makes Pipeline testable with stubs |
+| `ElectricalSource` | composition + ABC | Wraps ElectricalDB without duplicating SQL; swappable in Pipeline |
+| `Pipeline` | composition of two DataSources | Join logic isolated; depends on interface not implementation |
+| `SpecLimits` / `KpiSpec` | frozen @dataclass | Immutable config; free eq/repr; hashable |
+| `PrepConfig` | @dataclass + field(default_factory) | Mutable config builder; mutable-default trap avoided |
+| `VthAnalysis` | @property + validated setters | Computed yield always consistent; invalid bounds caught immediately |
+| `ReportRenderer` | ABC + Template Method | Add new formats without touching existing code |
+
+The workflow that took five notebooks and scattered functions is now:
+
+```python
+joined = Pipeline(ElectricalSource(ELEC_DB), ProcessSource(PROC_DB)).run()
+model  = smf.ols("mean_tft_vth ~ etch_gate_s", data=joined).fit()
+```
+
+Testable, swappable, readable.
