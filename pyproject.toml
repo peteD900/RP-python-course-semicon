@@ -2,7 +2,7 @@
 name = "fab-toolkit"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pandas>=2", "plotnine>=0.12", "sqlalchemy>=2"]
+dependencies = ["pandas>=2", "plotnine>=0.12", "sqlalchemy>=2", "pyarrow>=15"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov"]

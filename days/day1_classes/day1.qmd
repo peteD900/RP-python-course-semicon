@@ -1,5 +1,5 @@
 ---
-title: "Day 1 — Classes & Instances: From Dicts to `WaferDataset`"
+title: "Day 1 — Classes & Instances: Wrapping a Database Query"
 subtitle: "Real Python OOP course · semiconductor edition"
 format:
   html:
@@ -16,54 +16,28 @@ jupyter: python3
 
 ## Who this is for
 
-You already write competent procedural Python: you live in pandas, you have a
-`get_data.py` module full of helper functions you reuse across notebooks, and
-you can wrangle a messy extract into a tidy frame without thinking about it.
-What you *haven't* deliberately practised is **object-oriented design** — and,
-just as importantly, **knowing when it's worth it.**
+You already write competent procedural Python — pandas, helper functions in a
+`get_data.py` module, maybe some SQL via `pd.read_sql`. What you haven't
+deliberately practised is **object-oriented design**, and just as importantly,
+**knowing when it's worth it**.
 
-This course teaches classes, but the real skill is judgment. So Day 1 does two
-things at once:
+This day builds `ElectricalDB`: a class that wraps a SQLite connection and
+handles the three things that actually get tedious at scale — building SQL
+filters, doing device-type-specific processing, and caching results for quick
+reload. Every concept (class, `__init__`, instance attributes, methods,
+`__repr__`) is motivated by a real task, not introduced as abstract theory.
 
-1. Builds your first genuinely useful class, `WaferDataset`, one concept at a
-   time, with the *why* spelled out for each piece.
-2. Is honest about **when a class is the wrong tool** — because most of your
-   EDA helpers should stay plain functions, and you should be able to say
-   exactly why.
+There's also an honest **tradeoffs section**, because most of your EDA helpers
+should stay plain functions, and you should be able to say exactly why.
 
-By the end you'll understand `__init__`, `self`, the class-vs-instance attribute
-distinction (and the bug it causes), methods, `__repr__` — and you'll have a
-defensible mental model for *class vs function vs dataclass vs just-a-dataframe*.
+> **Before rendering:** run `python data/generate.py` from the repo root to
+> create the SQLite databases. The path below is relative to this file's
+> directory (`days/day1_classes/`), which is where Quarto sets the working
+> directory during render.
 
 ---
 
-## The fab context
-
-We're analysing **PCM (Process Control Monitoring) data**: small electrical test
-structures placed at fixed sites on each wafer and measured after key process
-steps. The headline parameter today is **Vth** (threshold voltage) — roughly,
-the gate voltage at which a transistor turns on. A Vth that drifts out of spec
-means the devices behave differently than designed, which shows up as yield loss
-or binning shifts downstream.
-
-The data is **synthetic but structurally realistic** (`data/generate.py`,
-seeded). It is deliberately *not* real fab data — the physics is simplified so we
-can focus on software design, not device modelling. There's a planted signal:
-one lot has a Vth excursion, and the capstone (Day 5) traces it back to a
-process-timing drift. Today we just learn to *hold* this data well.
-
-The shape of almost every fab-analysis task you'll do is the same loop:
-
-> **extract** (pull from a DB) → **munge** (filter, join, reshape) →
-> **model** (KPIs, a fit) → **plot** (wafer maps, trends) → **report**.
-
-Day 1 is about the very first handoff in that loop: once you've extracted a
-frame, *what do you carry it around in?* A bare DataFrame? A dict? Or something
-that also remembers where it came from and what you can do to it?
-
-> **Run `python data/generate.py` from the repo root before rendering this
-> notebook.** The path below is relative to this `.qmd` file's directory, which
-> is the working directory Quarto uses during render.
+## The database we're working with
 
 ```{python}
 import sqlite3
@@ -72,475 +46,515 @@ import pandas as pd
 
 DB_PATH = Path("../../data/electrical.db")
 
-conn = sqlite3.connect(DB_PATH)
-df_all = pd.read_sql("SELECT * FROM electrical", conn)
-conn.close()
+# Quick look at what's in there.
+with sqlite3.connect(DB_PATH) as conn:
+    df_peek = pd.read_sql("SELECT * FROM electrical LIMIT 5", conn)
 
-print(f"Total rows: {len(df_all):,}")
-print(f"Lots:       {sorted(df_all['lot_id'].unique())}")
-print(f"Wafers/lot: {df_all['wafer_id'].nunique()}")
-print(f"Sites/wafer:{df_all['site_id'].nunique()}")
-print(f"Devices:    {sorted(df_all['device_type'].unique())}")
-df_all.head()
-```
-
-So: 5 lots × 25 wafers × 9 PCM sites. Each row is one electrical measurement at
-one site on one wafer. That's the grain we'll work at all course.
-
----
-
-## Three recurring tasks (our running examples)
-
-Rather than invent abstractions and look for uses, let's start from three jobs
-you'll genuinely do over and over, and let the design fall out of them.
-
-- **Task A — "Pull everything for these lots."** A reliability engineer asks for
-  all data on lots L001 and L003 to compare against a reference. You subset by a
-  *list* of lots.
-- **Task B — "Just the TFTs, for a yield review."** The review only cares about
-  the transistor sites (`device_type == "TFT"`), not the resistors or capacitors.
-  You subset by device type.
-- **Task C — "Where did this come from?"** Three weeks later someone hands you a
-  CSV called `final_v2.csv` and asks what query produced it and when. You have no
-  idea. You need data that *carries its own provenance*.
-
-Tasks A and B are pure data wrangling — and you'll see they're perfectly fine as
-plain functions. Task C is the one that quietly justifies a class. Hold that
-thought; we'll come back to it.
-
----
-
-## The procedural baseline (this is not wrong!)
-
-Here's how you'd actually start: a couple of helper functions, exactly the kind
-you'd drop in `get_data.py`. **This is good, idiomatic, reusable code.** Do not
-let anyone tell you EDA must be objects-first.
-
-```{python}
-def load_electrical(db_path) -> pd.DataFrame:
-    """Extract the full electrical table."""
-    conn = sqlite3.connect(db_path)
-    try:
-        return pd.read_sql("SELECT * FROM electrical", conn)
-    finally:
-        conn.close()
-
-
-def filter_lots(df: pd.DataFrame, lot_ids: list[str]) -> pd.DataFrame:
-    """Task A — subset to a list of lots."""
-    return df[df["lot_id"].isin(lot_ids)].copy()
-
-
-def filter_devices(df: pd.DataFrame, device_type: str) -> pd.DataFrame:
-    """Task B — subset to one device type."""
-    return df[df["device_type"] == device_type].copy()
+print(f"Columns: {list(df_peek.columns)}")
+df_peek
 ```
 
 ```{python}
-df = load_electrical(DB_PATH)
-
-# Task A: lots L001 + L003
-ab = filter_lots(df, ["L001", "L003"])
-print("Task A rows:", len(ab))
-
-# Task B: TFTs only, within those lots
-abc = filter_devices(ab, "TFT")
-print("Task B rows:", len(abc))
+# Shape of the full dataset.
+with sqlite3.connect(DB_PATH) as conn:
+    counts = pd.read_sql("""
+        SELECT lot_id, device_type, COUNT(*) as n
+        FROM electrical
+        GROUP BY lot_id, device_type
+        ORDER BY lot_id, device_type
+    """, conn)
+counts
 ```
 
-Clean. Composable. Each function does one thing, takes a frame, returns a frame.
-If this were the whole job, **we'd stop here and there would be no lesson.** The
-functions are stateless transforms — the best possible fit for a function.
-
-So where does it strain?
+5 lots × 25 wafers × 9 PCM sites = 1,125 rows per lot, 5,625 total.
+Each row is one electrical measurement at one site on one wafer.
+The three device types — TFT, resistor, capacitor — need different handling
+throughout the course.
 
 ---
 
-## Where the dict/function approach strains
+## 1 · The same five lines, over and over
 
-The strain isn't in the *transforms*. It's in everything you want to keep
-*alongside* the data — Task C. Watch three specific failures.
-
-### Pain 1 — Provenance evaporates
-
-The frame `abc` knows nothing about itself. Which DB? Which query? Fetched when?
-The natural fix is to staple metadata on with a dict:
+Every analysis notebook you write starts the same way. Want the TFT data for
+a specific set of lots? Here's the raw approach:
 
 ```{python}
-record = {
-    "data":       abc,
-    "source":     "electrical.db",
-    "query":      "lots L001,L003; TFT only",
-    "fetched_at": "2024-01-15",
-}
+lots_of_interest = ["L001", "L003"]
+
+# The query for "give me TFT rows for these lots":
+placeholders = ",".join("?" * len(lots_of_interest))
+sql = f"SELECT * FROM electrical WHERE lot_id IN ({placeholders}) AND device_type = 'TFT'"
+
+with sqlite3.connect(DB_PATH) as conn:
+    df_tft = pd.read_sql(sql, conn, params=lots_of_interest)
+
+print(f"{len(df_tft)} rows")
+df_tft.head(3)
 ```
 
-But nothing keeps that dict in sync with the data. The moment you transform
-again, you either rebuild the dict by hand (tedious, error-prone) or it goes
-stale and *lies* about what it contains. Provenance that drifts is worse than
-no provenance.
-
-### Pain 2 — Nothing enforces structure
-
-Dicts accept anything. Typos and missing keys fail *later*, far from the cause:
+That works. But now you also need the resistors for a sheet-resistance review:
 
 ```{python}
-bad = {
-    "data":       abc,
-    "sorce":      "electrical.db",   # typo — silently accepted
-    "fetced_at":  "2024-01-15",      # typo — silently accepted
-}
-print("Keys:", list(bad.keys()))
-# Later, miles away: bad["source"] -> KeyError. Good luck tracing it.
+# Same dance, different device type.
+sql2 = f"SELECT * FROM electrical WHERE lot_id IN ({placeholders}) AND device_type = 'resistor'"
+
+with sqlite3.connect(DB_PATH) as conn:
+    df_res = pd.read_sql(sql2, conn, params=lots_of_interest)
+
+print(f"{len(df_res)} rows")
 ```
 
-### Pain 3 — The transforms and the metadata don't travel together
+And maybe you want everything for a single lot, no device filter:
 
-`filter_devices` operates on the *frame*, not the *record*. So after filtering
-you have a new frame and a now-wrong dict. You can write `filter_record(record,
-...)` wrappers, but you're hand-rolling the coupling between data and metadata
-that a class gives you for free — and you'll forget to update one field
-eventually.
+```{python}
+single = ["L003"]
+ph2 = ",".join("?" * len(single))
+sql3 = f"SELECT * FROM electrical WHERE lot_id IN ({ph2})"
 
-The throughline: **the data and the facts about the data want to move as one
-unit, and stay consistent under transformation.** That coupling-with-invariants
-is precisely what a class is *for*. Tasks A and B didn't need it; Task C does.
+with sqlite3.connect(DB_PATH) as conn:
+    df_l3 = pd.read_sql(sql3, conn, params=single)
+
+print(f"{len(df_l3)} rows")
+```
+
+You're already repeating the `placeholders` dance three times in one notebook.
+Across five notebooks, with slightly different WHERE clauses, things diverge.
+One notebook hardcodes `"L001"` as a string literal and breaks when the lot
+changes. Another forgets the `params=` argument and uses f-string interpolation,
+which opens a SQL injection vector even in a local script (a bad habit to build).
 
 ---
 
-## Building the class, one concept at a time
+## 2 · The procedural fix — and where it stops working
 
-### `class`, `__init__`, and what `self` actually is
+The natural first move is a helper function in `get_data.py`. This is not wrong:
+
+```{python}
+def fetch_electrical(db_path, lots=None, device_type=None):
+    """Fetch electrical rows with optional SQL-level filtering."""
+    clauses, params = [], []
+    if lots:
+        clauses.append(f"lot_id IN ({','.join('?'*len(lots))})")
+        params.extend(lots)
+    if device_type:
+        clauses.append("device_type = ?")
+        params.append(device_type)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with sqlite3.connect(db_path) as conn:
+        return pd.read_sql(f"SELECT * FROM electrical {where}", conn, params=params)
+
+# Clean, parameterised, reusable across notebooks.
+df = fetch_electrical(DB_PATH, lots=["L001", "L003"], device_type="TFT")
+print(len(df), "rows")
+```
+
+**Keep this function.** For a one-off query or a quick EDA script, it's the
+right tool — simple, stateless, easy to copy into another project.
+
+It strains under two specific pressures:
+
+1. **Device-type processing is different per type.** TFTs need Vth z-scoring and
+   outlier flags. Resistors need sheet-resistance normalisation. Capacitors need
+   their own checks. You end up with `process_tft(df)`, `process_resistor(df)`,
+   `process_capacitor(df)` as separate functions, and callers have to remember to
+   call the right one after fetching. It's easy to forget, and there's nothing
+   stopping someone from calling `process_tft` on resistor rows.
+
+2. **Caching is stateful.** If you want "run the query once, save to parquet,
+   reload instantly next session", you can write that as a function — but it needs
+   to know something about the query that was run, which means you're either
+   threading that context through every call or storing it somewhere. That
+   "somewhere" is exactly what an object's instance attributes are for.
+
+---
+
+## 3 · Building `ElectricalDB` — the class solution
+
+### `class`, `__init__`, and `self`
 
 ```{python}
 from datetime import datetime
 
-class WaferDataset:                                    # the blueprint
-    def __init__(self, data, source, lot_id=None):     # the initialiser
-        self.data       = data                         # store on THIS instance
-        self.source     = source
-        self.lot_id     = lot_id
-        self.fetched_at = datetime.now()
+class ElectricalDB:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self._cache = {}         # in-memory cache — more on this in §4
+        # Fail fast: test the connection immediately so a bad path
+        # raises here, not mid-notebook when you try to fetch.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1")
 ```
 
-Three things worth slowing down on:
+Three things to pause on:
 
-- **`class WaferDataset:` is a factory, not an object.** Calling it,
-  `WaferDataset(...)`, manufactures a new *instance*. The class is the cookie
-  cutter; instances are the cookies.
-- **`__init__` is not a constructor in the C++/Java sense.** By the time it runs,
-  the object already exists; `__init__`'s job is purely to *initialise* its
-  attributes. It's an ordinary method with a reserved name.
-- **`self` is just the instance, passed explicitly.** There's nothing magic about
-  the word — it's the first parameter, and Python binds it to the instance for
-  you. `self.data = data` writes `data` into *this specific object's* namespace.
+**`class ElectricalDB:` is a factory, not an object.** Calling it —
+`ElectricalDB("data/electrical.db")` — produces an *instance*. The class is the
+blueprint; instances are the built things. You can have `db_dev`, `db_prod`, and
+`db_test` as three independent instances, each pointing at a different file.
 
-That last point is worth proving, because it demystifies the whole model:
+**`__init__` is not a "constructor" in the C++/Java sense.** By the time it
+runs, the object already exists. `__init__` purely *initialises* its attributes.
+It's a normal method with a reserved name.
+
+**`self` is the instance, passed explicitly.** There's no magic:
+`db.fetch()` and `ElectricalDB.fetch(db)` are identical. `self.db_path = ...`
+writes into *this specific object's* namespace — you can see that namespace
+directly:
 
 ```{python}
-ds = WaferDataset(df_all, source="sqlite:electrical.db", lot_id=None)
-
-# A method call is sugar for calling the function with the instance as arg 1:
-print(ds.lot_id)                       # attribute access
-print(type(ds))                        # <class '__main__.WaferDataset'>
-
-# Where do the attributes actually live? In a per-instance dict:
-print(ds.__dict__)
+db = ElectricalDB(DB_PATH)
+print(db.__dict__)   # {'db_path': PosixPath(...), '_cache': {}}
 ```
 
-`ds.__dict__` is the instance's own namespace — a plain dict mapping attribute
-names to values. This is not a metaphor; it's literally how attribute storage
-works, and in a moment it will explain a notorious bug exactly.
+`__dict__` is the instance's own attribute storage. Attribute lookup checks
+here first, then falls back to the class. That lookup order is what makes the
+next section's bug possible.
 
-### Class vs instance attributes — and the mutable-default trap
+---
 
-Attributes can live in two places: on the **instance** (in `instance.__dict__`)
-or on the **class** (in `Class.__dict__`, shared by every instance). Attribute
-*lookup* checks the instance first, then falls back to the class. That fallback
-is useful for constants — and a landmine for mutables.
+## 4 · The mutable class-attribute trap
+
+The in-memory cache in `__init__` above is `self._cache = {}`.
+Here's what happens if you put it at the *class level* instead:
 
 ```{python}
-# ❌  THE TRAP — do not copy this
+# ❌ THE TRAP — never do this with a mutable default
 
-class BadRegistry:
-    seen_lots = []          # lives on the CLASS, shared by all instances
+class BadDB:
+    _cache = {}          # lives on the CLASS, shared by ALL instances
 
-    def __init__(self, lot_id):
-        self.lot_id = lot_id
-        self.seen_lots.append(lot_id)   # mutates the ONE shared list
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
 
+db_a = BadDB(DB_PATH)
+db_b = BadDB(DB_PATH)
 
-r1 = BadRegistry("L001")
-r2 = BadRegistry("L002")
-r3 = BadRegistry("L003")
+db_a._cache["tft_l001"] = "some result"
 
-print("r2 sees:", r2.seen_lots)             # ['L001','L002','L003'] — everyone's!
-print("same object?", r1.seen_lots is r3.seen_lots)  # True
+print("db_b sees:", list(db_b._cache.keys()))   # ['tft_l001'] — wrong!
+print("same object?", db_a._cache is db_b._cache)  # True
 ```
 
-Now the mechanism is obvious, not mysterious: `seen_lots` is never written into
-any instance's `__dict__`. Every `self.seen_lots` lookup misses the instance and
-finds the *single* list on the class, and they all append to it. The fix is to
-give each instance its own list, in `__init__`:
+`_cache` was never written into any instance's `__dict__`. Every `self._cache`
+lookup misses the instance and finds the *single* dict on the class. All
+instances share it. Cached results from one analysis contaminate another.
 
 ```{python}
-# ✅  The fix
+# ✅ The fix: initialise in __init__, so every instance gets its own dict.
 
-class GoodRegistry:
-    def __init__(self, lot_id):
-        self.lot_id    = lot_id
-        self.seen_lots = []                 # fresh list per instance
-        self.seen_lots.append(lot_id)
+class GoodDB:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self._cache = {}         # fresh dict per instance
 
+db_a = GoodDB(DB_PATH)
+db_b = GoodDB(DB_PATH)
 
-g1 = GoodRegistry("L001")
-g2 = GoodRegistry("L002")
-print("g1:", g1.seen_lots, " g2:", g2.seen_lots)   # ['L001']  ['L002']
-print("same object?", g1.seen_lots is g2.seen_lots)  # False
+db_a._cache["tft_l001"] = "some result"
+
+print("db_b sees:", list(db_b._cache.keys()))   # [] — correct
+print("same object?", db_a._cache is db_b._cache)  # False
 ```
 
-**Rule:** immutable shared values (constants, a default string) are fine as class
-attributes; **mutable defaults (list, dict, set) must be created in `__init__`.**
-You'll meet this exact hazard again on Day 4 with `@dataclass`, where the cure is
-`field(default_factory=list)` — same disease, same shape, different syntax.
+**Rule:** mutable defaults (dict, list, set) must be created in `__init__`.
+Immutable class-level values (a string constant, a frozen config) are fine.
+You'll meet this exact trap again on Day 4 with `@dataclass`, where the
+fix is `field(default_factory=dict)` — same disease, different syntax.
 
-### Methods — Task A and Task B, now coupled to provenance
+---
 
-A method is just a function defined in the class body whose first parameter is
-the instance. The payoff: the transform and the metadata now move together, and
-the result is *another* `WaferDataset` that still knows its origin.
+## 5 · SQL-level filtering with `fetch()`
+
+Now we add the method that replaces the `fetch_electrical` free function —
+but with the WHERE-building logic living *inside* the class so it can't get
+out of sync with the connection management:
 
 ```{python}
-class WaferDataset:
-    def __init__(self, data, source, lot_id=None, fetched_at=None):
-        self.data       = data
-        self.source     = source
-        self.lot_id     = lot_id
-        self.fetched_at = fetched_at or datetime.now()
+class ElectricalDB:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self._cache = {}
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1")
 
-    def summary(self):
-        """Descriptive stats of the numeric columns."""
-        return self.data.describe()
+    def fetch(self, lots=None, device_types=None):
+        """Query with SQL-level filtering — never loads more than needed."""
+        clauses, params = [], []
 
-    def filter_device(self, device_type):           # Task B
-        mask = self.data["device_type"] == device_type
-        return WaferDataset(
-            data=self.data.loc[mask].copy(),         # .copy(): see note below
-            source=self.source,
-            lot_id=self.lot_id,
-            fetched_at=self.fetched_at,              # carry provenance forward
-        )
+        if lots:
+            placeholders = ",".join("?" * len(lots))
+            clauses.append(f"lot_id IN ({placeholders})")
+            params.extend(lots)
 
-    def filter_lots(self, lot_ids):                  # Task A
-        mask = self.data["lot_id"].isin(lot_ids)
-        remaining = lot_ids[0] if len(lot_ids) == 1 else None
-        return WaferDataset(
-            data=self.data.loc[mask].copy(),
-            source=self.source,
-            lot_id=remaining,
-            fetched_at=self.fetched_at,
-        )
+        if device_types:
+            placeholders = ",".join("?" * len(device_types))
+            clauses.append(f"device_type IN ({placeholders})")
+            params.extend(device_types)
+
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM electrical {where}"
+
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql(sql, conn, params=params)
 ```
 
 ```{python}
-ds = WaferDataset(df_all, "sqlite:electrical.db", lot_id=None)
+db = ElectricalDB(DB_PATH)
 
-# Task A then Task B — each step returns a WaferDataset, not a bare frame:
-review = ds.filter_lots(["L001", "L003"]).filter_device("TFT")
-
-print("original rows:", len(ds.data))      # unchanged
-print("review rows:  ", len(review.data))
-print("review source:", review.source)     # provenance survived both filters
+# Task: "give me TFT rows for lots L001 and L003"
+df = db.fetch(lots=["L001", "L003"], device_types=["TFT"])
+print(f"{len(df)} rows, lots: {sorted(df['lot_id'].unique())}")
 ```
 
-Two design choices to call out, because they're the whole point:
+A few design choices worth naming explicitly:
 
-1. **Every filter returns a new `WaferDataset` and never mutates `self`.** That's
-   a *functional* style layered on top of mutable pandas. The `.copy()` is what
-   makes it honest: without it, the slice could share memory with the parent and
-   a later edit would silently reach back and change the original (and pandas
-   would warn). Immutability-by-convention makes chains like the one above safe
-   to reason about.
-2. **Provenance is threaded through automatically.** This is Task C, solved. A
-   filtered dataset cannot lose track of its `source` or `fetched_at`, because
-   the only way to make one is through a method that copies them forward. The
-   dict approach *let* you forget; the class makes forgetting impossible.
+**We use parameterised queries, not f-string interpolation.**
+`... WHERE lot_id IN ({placeholders})` with `params=lots` lets the database
+driver handle quoting. If you write `f"... WHERE lot_id IN ({lots})"` instead,
+you've opened a SQL injection vulnerability — even in a personal script, it's a
+habit worth not building.
 
-> **Bound methods, briefly.** `ds.filter_device` is a *bound method* — the
-> function `WaferDataset.filter_device` with `ds` pre-bound as `self`. These two
-> lines are identical:
->
-> ```python
-> ds.filter_device("TFT")
-> WaferDataset.filter_device(ds, "TFT")
-> ```
->
-> That equivalence is all "methods" really are. No magic.
+**We never `SELECT *` then filter in Python.**
+On a real production database, an electrical table might have 50M rows across
+thousands of lots. Pulling all of that into a pandas DataFrame to then call
+`.query("lot_id == 'L001'")` would be absurdly slow. Push filters into SQL;
+move only what you need across the wire.
 
-### `__repr__` (and its sibling `__str__`)
+**The `with` statement handles connection cleanup.**
+`with sqlite3.connect(...) as conn:` ensures the connection is closed even if
+the query raises. Using `try/finally` does the same thing; `with` is neater.
 
-Without `__repr__`, inspecting an object gives you a memory address — useless in
-a data workflow where you're constantly eyeballing intermediate results:
+---
+
+## 6 · Device-type dispatch
+
+Different device types need different post-processing. TFTs: z-score Vth,
+flag outliers. Resistors: normalise sheet resistance. Capacitors: their own
+checks (stubbed for now — extended in Day 3).
+
+The naive approach: a chain of `if/elif` in the caller, every notebook.
+The class approach: a `fetch_device()` method that fetches *and* processes in
+one call, with device dispatch handled internally.
 
 ```{python}
-class Bare:
-    pass
-print(Bare())     # <__main__.Bare object at 0x...> — tells you nothing
+class ElectricalDB:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self._cache = {}
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1")
+
+    def fetch(self, lots=None, device_types=None):
+        clauses, params = [], []
+        if lots:
+            placeholders = ",".join("?" * len(lots))
+            clauses.append(f"lot_id IN ({placeholders})")
+            params.extend(lots)
+        if device_types:
+            placeholders = ",".join("?" * len(device_types))
+            clauses.append(f"device_type IN ({placeholders})")
+            params.extend(device_types)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql(f"SELECT * FROM electrical {where}", conn, params=params)
+
+    def fetch_device(self, device_type, lots=None):
+        """Fetch + apply device-type-specific processing in one call."""
+        df = self.fetch(lots=lots, device_types=[device_type])
+        return self._process(df, device_type)
+
+    def _process(self, df, device_type):
+        """Dispatch to the right processor. Private: callers use fetch_device."""
+        processors = {
+            "TFT":       self._process_tft,
+            "resistor":  self._process_resistor,
+            "capacitor": self._process_capacitor,
+        }
+        fn = processors.get(device_type)
+        if fn is None:
+            raise ValueError(f"Unknown device_type {device_type!r}")
+        return fn(df)
+
+    def _process_tft(self, df):
+        df = df.copy()
+        mu, sigma = df["vth"].mean(), df["vth"].std()
+        df["vth_zscore"]  = (df["vth"] - mu) / sigma
+        df["vth_flag"]    = df["vth_zscore"].abs() > 2.5
+        return df
+
+    def _process_resistor(self, df):
+        df = df.copy()
+        mu, sigma = df["rsheet"].mean(), df["rsheet"].std()
+        df["rsheet_zscore"] = (df["rsheet"] - mu) / sigma
+        return df
+
+    def _process_capacitor(self, df):
+        return df.copy()    # stub — extended in Day 3
 ```
 
-`__repr__` is the **developer-facing** description. The convention (the "repr
-contract") is that it should be unambiguous and, ideally, look like the code that
-would recreate the object. `__str__` is the **user-facing** description; if you
-don't define it, `str()` and `print()` fall back to `__repr__`. For a data tool,
-a single good `__repr__` is usually all you need.
+```{python}
+db = ElectricalDB(DB_PATH)
+
+tft = db.fetch_device("TFT", lots=["L001", "L003"])
+print(f"TFT rows: {len(tft)}")
+print(f"New columns: {[c for c in tft.columns if c not in df_peek.columns]}")
+
+# Any flagged outliers? (The LOT003 excursion should show up here.)
+print(f"\nFlagged rows:\n{tft[tft['vth_flag']][['lot_id','wafer_id','site_id','vth','vth_zscore']]}")
+```
+
+Two naming conventions shown here:
+
+**`_process` and `_process_*` are "private by convention."** The leading
+underscore tells collaborators "this is an implementation detail; call
+`fetch_device`, not this." Python doesn't enforce it — nothing stops you from
+calling `db._process_tft(df)` — but the underscore is a widely respected signal.
+Day 4 introduces `@property` for cases where you want to *enforce* read-only
+access rather than just signal it.
+
+**The dispatch dict instead of `if/elif`.**
+A dispatch dict (`processors = {"TFT": self._process_tft, ...}`) scales more
+cleanly than a chain of `elif device_type == "..."`. It's also the right shape
+for what Day 3 replaces it with (a `DataSource` ABC and polymorphism) — the
+dispatch dict is the procedural approximation of polymorphism.
+
+---
+
+## 7 · Local parquet cache
+
+Query results that take a second to compute should survive notebook restarts.
+The standard pattern: query once, save to parquet, reload fast on subsequent
+runs. Here it's a method on the class — not because a free function couldn't
+do it, but because the save/load pair are natural utilities to namespace
+alongside the thing that produces the data.
 
 ```{python}
-class WaferDataset:
-    def __init__(self, data, source, lot_id=None, fetched_at=None):
-        self.data       = data
-        self.source     = source
-        self.lot_id     = lot_id
-        self.fetched_at = fetched_at or datetime.now()
+class ElectricalDB:
+    # ... (previous methods) ...
+
+    def save_parquet(self, df, path):
+        """Save a query result for fast reload in the next session."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(p, index=False)
+
+    @staticmethod
+    def load_parquet(path):
+        """Load a previously saved result.
+
+        @staticmethod: doesn't need self — it's just a utility namespaced
+        to the class. Day 2 shows @classmethod for constructors that do
+        need the class itself (e.g. WaferDataset.from_db(...)).
+        """
+        return pd.read_parquet(path)
+```
+
+```{python}
+#| eval: false
+# Typical usage pattern:
+CACHE = Path("../../data/cache/tft_l001_l003.parquet")
+
+if CACHE.exists():
+    tft = ElectricalDB.load_parquet(CACHE)      # fast path: ~milliseconds
+    print("Loaded from cache")
+else:
+    db  = ElectricalDB(DB_PATH)
+    tft = db.fetch_device("TFT", lots=["L001", "L003"])
+    db.save_parquet(tft, CACHE)
+    print("Queried DB and cached result")
+
+print(tft.shape)
+```
+
+The `@staticmethod` decorator is introduced here because `load_parquet` has no
+need for `self` — it just reads a file. A plain module function would also work.
+The tradeoff: keeping it on the class makes it discoverable alongside
+`save_parquet` (`db.save_parquet(...)`, `ElectricalDB.load_parquet(...)`), but
+it could equally live in a `utils.py` module. The right answer depends on how
+widely you'd reuse it.
+
+---
+
+## 8 · `__repr__` — state that's worth reporting
+
+Without `__repr__`, Python gives you a memory address:
+
+```{python}
+class BareDB:
+    def __init__(self, path):
+        self.db_path = Path(path)
+
+print(BareDB(DB_PATH))    # <__main__.BareDB object at 0x...>
+```
+
+`__repr__` is the **programmer-facing** description. Convention: make it
+unambiguous, and where practical make it look like the code that would
+recreate the object.
+
+For `ElectricalDB` the two interesting bits of state are the database file and
+how many queries are in the in-memory cache — both worth seeing at a glance:
+
+```{python}
+class ElectricalDB:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self._cache  = {}
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1")
 
     def __repr__(self):
         return (
-            f"WaferDataset("
-            f"lot={self.lot_id!r}, "        # !r -> calls repr(), so strings get quotes
-            f"rows={len(self.data)}, "
-            f"source={self.source!r})"
+            f"ElectricalDB("
+            f"db={self.db_path.name!r}, "      # !r puts quotes around the string
+            f"cached={len(self._cache)} queries)"
         )
-
-    def summary(self):
-        return self.data.describe()
-
-    def filter_device(self, device_type):
-        mask = self.data["device_type"] == device_type
-        return WaferDataset(self.data.loc[mask].copy(), self.source,
-                            self.lot_id, self.fetched_at)
 ```
 
 ```{python}
-ds = WaferDataset(df_all[df_all.lot_id == "L001"].copy(),
-                  "sqlite:electrical.db", "L001")
-print(ds)                       # WaferDataset(lot='L001', rows=225, source='sqlite:electrical.db')
-print(ds.filter_device("TFT"))  # WaferDataset(lot='L001', rows=75, source='sqlite:electrical.db')
+db = ElectricalDB(DB_PATH)
+print(db)                       # ElectricalDB(db='electrical.db', cached=0 queries)
+
+db._cache["tft_l001"] = None    # simulate a cached query
+print(db)                       # ElectricalDB(db='electrical.db', cached=1 queries)
 ```
 
-The `!r` matters: it makes the repr show `lot='L001'` (quoted, unambiguous)
-rather than `lot=L001` (is that a string? a variable?). In loops, logs, and
-interactive sessions this difference is the gap between "I can see what I have"
-and "I'm printing memory addresses again."
+The `!r` in the f-string calls `repr()` on the value, which wraps strings in
+quotes. Without it `db='electrical.db'` becomes `db=electrical.db` — is that a
+string? a variable? `!r` makes it unambiguous. Use it for any string field in
+`__repr__`.
 
 ---
 
-## When **not** to reach for a class
+## 9 · Using the installed `fab_toolkit` version
 
-This is the section the rest of the course assumes but rarely says out loud.
-Classes are a tool, not a virtue. Reaching for one reflexively produces code
-that's *harder* to read than the procedural version. Here's how to decide.
-
-### A decision checklist
-
-Reach for a **class** when **several** of these are true:
-
-- **State + behaviour travel together.** The data and the operations on it
-  belong as one unit (our `WaferDataset`: a frame + how you filter/summarise it).
-- **There are invariants to protect.** Something must stay consistent — here,
-  *provenance must survive every transform.* If you find yourself writing "and
-  don't forget to also update X", a class can make X impossible to forget.
-- **You'll have multiple independent instances** with their own state.
-- **You want a stable interface that hides representation.** Callers shouldn't
-  care that it's SQLite underneath (this is the seam Day 3's `DataSource` widens,
-  so swapping in a real database later is trivial).
-- **You'll want polymorphism** — different things responding to the same method
-  name (Day 3).
-
-Stick with a **plain function** (or a module of them — your `get_data.py`) when:
-
-- The operation is a **stateless transform**: frame in, frame out, no memory.
-  *Our `filter_lots`/`filter_devices` started here and were completely fine.*
-- You'll reuse it across **many** unrelated data shapes. A free function
-  `filter_lots(df, ids)` works on any frame; a method only works on a
-  `WaferDataset`.
-- There's **no invariant** that needs guarding.
-
-Reach for a **`@dataclass`** (Day 4) when you mostly need to *hold* related
-fields with free `__init__`/`__repr__`/`__eq__` and little behaviour — config
-objects, spec limits.
-
-And sometimes the right answer is **just a DataFrame** (or a dict): if a wrapper
-buys you nothing, don't add one.
-
-### Smells that you've over-classed
-
-- **The namespace class.** Every method is `@staticmethod`, there's no real
-  `self` state — you've written a module with extra steps. Use a module.
-- **The script-in-a-class.** `__init__` does all the work and there's one
-  `run()` method. That's a procedure wearing a costume; write functions.
-- **Premature wrapping.** You built a class before you had two call sites. Wait
-  for the second use; let the abstraction be *pulled* out of real duplication,
-  not pushed in speculatively.
-- **Getter/setter soup.** A `get_x`/`set_x` pair for every field that does
-  nothing but read and write it. In Python, expose the attribute; introduce
-  `@property` (Day 4) *only* when you have real validation or computation.
-
-### So why does `WaferDataset` survive the test?
-
-Be skeptical of our own class for a second. Its filters are stateless transforms
-— by the checklist, those alone would argue for plain functions. What tips it
-over is **Task C, the invariant**: *a dataset must never be separated from its
-provenance, even after arbitrary filtering.* The class is the cheapest way to
-make that guarantee structural rather than a thing you remember. Take the
-invariant away and honestly, `filter_lots(df, ids)` would be the better design.
-
-Keep your `get_data.py` helpers. They're not a failure of OOP discipline —
-they're the right tool for stateless extract-and-reshape. The class earns its
-keep at exactly the point where *consistency under transformation* starts to
-matter.
-
----
-
-## Using the installed package
-
-Everything above we built by hand to see the mechanics. The polished version
-lives in `fab_toolkit` (installed via `uv sync --extra dev`) and is what the
-later days build on. Let's use it to look at the planted signal that drives the
-whole course.
+Everything above we built by hand to see every line. The polished version is in
+`fab_toolkit` (installed via `uv sync --extra dev`). Let's use it to look at the
+LOT003 Vth signal that the capstone investigates.
 
 ```{python}
-from fab_toolkit import WaferDataset
+from fab_toolkit import ElectricalDB
 
-conn = sqlite3.connect(DB_PATH)
-df = pd.read_sql("SELECT * FROM electrical", conn)
-conn.close()
+db = ElectricalDB(DB_PATH)
+print(db)
 
-ds = WaferDataset(df, source="sqlite:electrical.db", lot_id=None)
-print(ds)
-
-# Task A + B together, via the real toolkit:
-l3_tft = ds.filter_lots(["L003"]).filter_device("TFT")
-print(l3_tft)
-```
-
-```{python}
-# Mean TFT Vth per lot — one of these lots is not like the others.
-tft = ds.filter_device("TFT")
-(
-    tft.data
-    .groupby("lot_id")["vth"]
-    .agg(mean_vth="mean", std_vth="std", n="count")
+# Fetch TFTs for all lots, look at the lot-level means.
+tft_all = db.fetch_device("TFT")
+print(
+    tft_all.groupby("lot_id")["vth"]
+    .agg(mean_vth="mean", std_vth="std", pct_flagged=lambda s: s.name)
+    .assign(pct_flagged=lambda df: tft_all.groupby("lot_id")["vth_flag"].mean().round(3))
     .round(4)
 )
 ```
 
 ```{python}
-# A first look (proper wafer maps come in Day 5).
+# Visualise — proper wafer maps in Day 5.
 try:
     from plotnine import ggplot, aes, geom_boxplot, labs, theme_bw
     p = (
-        ggplot(tft.data, aes("lot_id", "vth", fill="lot_id"))
+        ggplot(tft_all, aes("lot_id", "vth", fill="lot_id"))
         + geom_boxplot(show_legend=False)
-        + labs(title="TFT Vth by lot — spot the outlier",
+        + labs(title="TFT Vth by lot — LOT003 is the outlier",
                x="Lot", y="Vth (V)")
         + theme_bw()
     )
@@ -549,44 +563,101 @@ except ImportError:
     print("plotnine not installed — skipping plot")
 ```
 
-L003 sits clearly high. *Why* is the question the capstone answers (a process
-chamber whose etch step runs long) — but already you have a tidy object that
-knows what it holds and where it came from.
+LOT003 sits clearly high. Its outlier rows are the ones `vth_flag = True`.
+Why? A process-timing drift in a specific chamber — that's what Day 5 recovers.
+
+---
+
+## 10 · When *not* to reach for a class
+
+This section exists because the decision is genuinely worth making explicitly.
+
+### A decision checklist
+
+Reach for a **class** when several of these are true:
+
+- **State + behaviour are tightly coupled.** `ElectricalDB` holds a path and a
+  cache, and its methods depend on both. Separating them would mean passing `path`
+  and `cache` into every function call.
+- **There's an invariant to protect.** The fail-fast connection test in
+  `__init__` means you can't hold a broken `ElectricalDB` — it raises before the
+  object is fully constructed. With a free function there's no natural place to
+  put that guard.
+- **Dispatch logic coheres around a type.** The `_process_tft/resistor/capacitor`
+  methods belong together because they're all processing the same table. Scattering
+  them across a module would make it harder to see the pattern Day 3 will extract.
+- **You'll have multiple independent instances.** `db_dev = ElectricalDB("dev.db")`
+  and `db_prod = ElectricalDB("prod.db")` in the same script is a natural use.
+
+Stick with a **plain function** when:
+
+- The operation is **stateless**: frame in, frame out, no memory needed. Your
+  `get_data.py` helpers are completely fine here.
+- You want it to work on **any DataFrame**, not just ones produced by a
+  specific class. A free `process_tft(df)` is more reusable than a method.
+- There's no meaningful shared state. If you deleted `__init__` and `self` and
+  all you had were `@staticmethod`s, you've written a module in costume — just
+  use a module.
+
+Use a **`@dataclass`** (Day 4) when you mostly need a named bundle of fields with
+minimal behaviour. Config objects, spec limits: `@dataclass(frozen=True)` gives
+you `__init__`, `__repr__`, and `__eq__` for free.
+
+### Why `fetch_electrical()` is still fine
+
+Be sceptical of the class we just built. The `fetch()` method has no real state
+dependency — it only uses `self.db_path`, which you could equally pass as an
+argument. The thing that tips it into class territory for this course is the
+*combination*: path + cache + device dispatch + the fail-fast init guard all
+cohere around a single database. Remove any two of those and a function starts
+to look better again.
+
+Your instinct that you'd "usually just use helpers from `get_data.py`" is
+correct. The class earns its keep when enough behaviour coheres around a shared
+piece of state that bundling it is genuinely simpler than threading the state
+through every function call.
 
 ---
 
 ## Summary
 
-| Concept | What it is | Why you care here |
+| Concept | What it is | Where it shows up |
 |---|---|---|
-| `class` | A factory for instances | One blueprint, many datasets |
-| `__init__` | Initialiser, not constructor | Sets up per-instance attributes |
-| `self` | The instance, passed explicitly | `obj.m()` ≡ `Class.m(obj)` |
-| instance vs class attr | Stored in instance vs class `__dict__` | Explains the mutable-default trap |
-| method | Function bound to an instance | Couples a transform to its data + provenance |
-| `__repr__` / `__str__` | Dev-facing / user-facing text | Readable objects in logs and notebooks |
+| `class` | Blueprint for instances | `ElectricalDB` |
+| `__init__` | Initialises per-instance state; runs on construction | Stores `db_path`, `_cache`; tests connection |
+| `self` | The instance, passed explicitly | `self.db_path`, `self._cache` |
+| Instance attribute | Stored in `instance.__dict__`; fresh per object | `_cache = {}` in `__init__` |
+| Class attribute trap | Mutable default at class level is *shared* | `BadDB._cache = {}` shared across all instances |
+| Method | Function bound to an instance | `fetch()`, `fetch_device()` |
+| Private method | Leading `_` signals internal; no enforcement | `_process()`, `_process_tft()` |
+| Dispatch dict | Maps keys to callables; scales better than `if/elif` | `processors = {"TFT": self._process_tft, ...}` |
+| `@staticmethod` | No `self`; namespaced to the class | `load_parquet()` |
+| `__repr__` | Dev-facing description of object state | Shows db name + cache size |
 
-**The one-line takeaway:** a class earns its keep when *data, behaviour, and an
-invariant must stay coupled and consistent.* For `WaferDataset` the invariant is
-provenance-survives-filtering. Absent an invariant, your procedural helpers are
-the better, simpler choice — and knowing the difference is the actual skill.
+**The one-line takeaway:** a class earns its keep when state, behaviour, and an
+invariant all cohere around the same thing. `ElectricalDB` earns it — connection
+state, query building, device dispatch, and the fail-fast guard belong together.
+A bare `fetch_electrical(db_path, lots)` function is also fine; you reach for
+the class when you have *several* of those that all share `db_path` and cache.
 
 ---
 
-## What's next (Day 2)
+## What's next — Day 2
 
-`WaferDataset` still makes the caller open the database and build the frame
-first. On **Day 2** we push that responsibility *into* the class with
-`@classmethod` alternate constructors, so the scenarios from today get a clean
-front door:
+`ElectricalDB.fetch()` returns a plain DataFrame. On **Day 2** we build
+`WaferDataset` as a result container with `@classmethod` alternate constructors,
+so the query result carries a bit more structure without losing the pandas
+ergonomics:
 
 ```python
-# Day 2 preview — the "since date X" and "from a file" jobs become one-liners:
-ds = WaferDataset.from_sqlite("data/electrical.db", lots=["L001", "L003"])
-ds = WaferDataset.from_parquet("data/snapshot.parquet")
-ds = WaferDataset.from_csv("final_v2.csv")
+# Day 2 preview:
+ds = WaferDataset.from_db(db, lots=["L001", "L003"], device_type="TFT")
+ds = WaferDataset.from_parquet("cache/tft_l001_l003.parquet")
+len(ds)          # __len__
+ds["vth"]        # __getitem__
+for chunk in ds: # __iter__
+    ...
 ```
 
-We'll also implement the **data model** dunders — `__len__`, `__getitem__`,
-`__iter__`, `__eq__`, `__contains__` — so a `WaferDataset` behaves like a native
-Python container: `len(ds)`, `ds["vth"]`, `for chunk in ds`, `ds1 == ds2`.
+We'll also cover `@classmethod` vs `@staticmethod` in depth, and implement the
+full Python data model so a `WaferDataset` feels like a native container.
